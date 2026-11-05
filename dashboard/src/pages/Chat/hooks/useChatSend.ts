@@ -1,4 +1,3 @@
-import type { DeviceSelection } from "@/api/modules/devices";
 import { useCallback, useEffect } from "react";
 import type { TFunction } from "i18next";
 import { useNavigate } from "react-router-dom";
@@ -11,9 +10,7 @@ import {
 import type { HitlSessionPolicy } from "../utils/hitlSessionPolicy";
 import * as chatStore from "./chatStore";
 import { EMPTY_CHAT_SESSION_KEY, PENDING_THREAD_ID } from "../constants";
-import { clipThreadTitle } from "../utils/threadTitle";
 import { message } from "@/utils/antdMessage";
-import { useConversationPageVisible } from "../../../hooks/useConversationPageVisible";
 
 import {
   buildComposerContext,
@@ -25,8 +22,6 @@ import { parseSkillSlugsInText } from "../utils/skillSlash";
 interface UseChatSendParams {
   resolvedAgentId: string | null | undefined;
   activeThreadId: string | null;
-  sessions: Session[];
-  messagesLength: number;
   selectedModel: string | null;
   selectedConnectors: string[];
   selectedKnowledgeBaseIds: string[];
@@ -35,7 +30,6 @@ interface UseChatSendParams {
   reasoningEffort: string | null;
   conversationMode?: "ask" | "plan" | "craft";
   hitlPolicy?: HitlSessionPolicy;
-  device?: DeviceSelection | null;
   defaultModel?: string | null;
   sendMessage: (
     text: string,
@@ -52,17 +46,11 @@ interface UseChatSendParams {
     reasoningEffort?: string | null,
     conversationMode?: "ask" | "plan" | "craft" | null,
     hitlPolicy?: HitlSessionPolicy | null,
-    device?: DeviceSelection | null,
   ) => void;
   createSession: () => { session: Session; resolvedId: Promise<string> };
-  renameSession: (id: string, name: string) => void;
   /** Called when auto-recording starts successfully from a pending message. */
   onAutoRecordingStarted?: (recordingId: string) => void;
   t: TFunction;
-}
-
-function deriveThreadTitle(msg: string): string {
-  return clipThreadTitle(msg);
 }
 
 /** Optional composer snapshot used when flushing a queued message. */
@@ -79,14 +67,11 @@ export type ChatSendOverrides = {
   agentId?: string | null;
   conversationMode?: "ask" | "plan" | "craft";
   hitlPolicy?: HitlSessionPolicy;
-  device?: DeviceSelection | null;
 };
 
 export function useChatSend({
   resolvedAgentId,
   activeThreadId,
-  sessions,
-  messagesLength,
   selectedModel,
   selectedConnectors,
   selectedKnowledgeBaseIds,
@@ -95,15 +80,12 @@ export function useChatSend({
   reasoningEffort,
   conversationMode = "craft",
   hitlPolicy,
-  device,
   defaultModel,
   sendMessage,
   createSession,
-  renameSession,
   onAutoRecordingStarted,
   t,
 }: UseChatSendParams) {
-  const pageVisible = useConversationPageVisible();
   const navigate = useNavigate();
 
   /** @returns false when the send was rejected before starting a turn. */
@@ -122,24 +104,8 @@ export function useChatSend({
       const trimmed = text.trim();
       if (!trimmed && !(attachments && attachments.length > 0)) return false;
 
-      const maybeRenameNewThread = (tid: string, hadMessages: boolean) => {
-        const current = sessions.find((s) => s.id === tid);
-        if (current?.name === "New Chat" && !hadMessages) {
-          renameSession(tid, deriveThreadTitle(trimmed));
-        }
-      };
-
       const mode = overrides?.conversationMode ?? conversationMode;
       const policy = overrides?.hitlPolicy ?? hitlPolicy;
-      const selectedDevice =
-        overrides?.device !== undefined ? overrides.device : device;
-      if (
-        selectedDevice &&
-        (!selectedDevice.device_id || !selectedDevice.grant_id)
-      ) {
-        message.warning(t("devices.chooseDirectory"));
-        return false;
-      }
       const restricted = mode === "ask" || mode === "plan";
       const connectors = restricted
         ? []
@@ -173,8 +139,7 @@ export function useChatSend({
           ? overrides.modelRef
           : resolveTurnModelRef(modelSelection, defaultModel);
 
-      const runSend = (tid: string, hadMessages: boolean) => {
-        maybeRenameNewThread(tid, hadMessages);
+      const runSend = (tid: string) => {
         sendMessage(
           trimmed,
           "",
@@ -190,7 +155,6 @@ export function useChatSend({
           composerContext?.reasoningEffort ?? reasoningEffort,
           mode,
           policy,
-          selectedDevice,
         );
       };
 
@@ -202,11 +166,7 @@ export function useChatSend({
           message.info(t("chat.creatingSession", "正在创建会话，请稍候"));
           return false;
         }
-        const hadMessages =
-          targetThreadId === activeThreadId
-            ? messagesLength > 0
-            : chatStore.getSnapshot(targetThreadId).messages.length > 0;
-        runSend(targetThreadId, hadMessages);
+        runSend(targetThreadId);
         return true;
       }
 
@@ -229,13 +189,9 @@ export function useChatSend({
           message.error(t("chat.createSessionFailed", "创建会话失败，请重试"));
           return;
         }
-        const currentSnap = chatStore.getSnapshot(PENDING_THREAD_ID);
-        const hadMessages = currentSnap.messages.length > 1;
         chatStore.renameSessionKey(PENDING_THREAD_ID, tid);
-        // ``sessions`` in this closure predates the thread just created, so the
-        // name lookup in maybeRenameNewThread always misses here. A freshly
-        // created thread has no title yet — rename it straight away.
-        if (!hadMessages) renameSession(tid, deriveThreadTitle(trimmed));
+        // Title is filled by the server from an AI summary of this first
+        // message. Do not lock the raw question in as the thread name.
         if (policy) syncSessionHitlPolicy(tid, policy);
         chatStore.sendTurn(
           tid,
@@ -253,7 +209,7 @@ export function useChatSend({
           composerContext?.reasoningEffort ?? reasoningEffort,
           mode,
           policy,
-          selectedDevice,
+          userMsg.id,
         );
         navigate(`/chat/${agent}/${tid}`, { replace: true });
       });
@@ -261,11 +217,8 @@ export function useChatSend({
     },
     [
       activeThreadId,
-      sessions,
-      messagesLength,
       sendMessage,
       createSession,
-      renameSession,
       navigate,
       resolvedAgentId,
       selectedModel,
@@ -276,7 +229,6 @@ export function useChatSend({
       reasoningEffort,
       conversationMode,
       hitlPolicy,
-      device,
       defaultModel,
       t,
     ],
@@ -326,7 +278,7 @@ export function useChatSend({
               const pushMsg = {
                 id: generateId(),
                 role: "assistant" as const,
-                content: `🎬 录制已开始！请在浏览器中进行你想要自动化的操作。\n\n操作完成后，输入"结束"即可结束录制，系统将自动生成技能脚本。`,
+                content: t("skillRecord.recordingStartedMessage"),
                 timestamp: Date.now(),
                 status: "done" as const,
               };
@@ -341,14 +293,13 @@ export function useChatSend({
       }
     };
 
-    if (!pageVisible) return;
     consumePending();
 
     const handler = () => consumePending();
     window.addEventListener("octop:pending-chat-message", handler);
     return () =>
       window.removeEventListener("octop:pending-chat-message", handler);
-  }, [handleSend, activeThreadId, onAutoRecordingStarted, pageVisible]);
+  }, [handleSend, activeThreadId, onAutoRecordingStarted, t]);
 
   return { handleSend };
 }

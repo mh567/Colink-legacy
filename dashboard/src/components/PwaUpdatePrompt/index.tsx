@@ -2,17 +2,24 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { applyUpdate } from "../../pwa";
 import { updateApi } from "../../api/modules/update";
-import { isCompanyDesktop } from "../../api/desktopRuntime";
 import { useCurrentUser } from "../../hooks/useCurrentUser";
 import { userCan } from "../../utils/permissions";
 import styles from "./index.module.less";
 
 /**
+ * Dismissal flag for the current tab. The waiting Service Worker survives a
+ * reload, so without this the banner pops again on every navigation. Scoped to
+ * the session so a genuinely new version can prompt next time the tab opens.
+ */
+export const PWA_UPDATE_DISMISSED_KEY = "pwa:update-dismissed";
+
+/**
  * Listens for the "pwa:update-ready" event (dispatched by sw-register.ts) and
  * renders a dismissible banner so the user can choose when to reload.
  * Designed to be mounted once in MainLayout.
- * Enterprise desktop clients receive packages from their administrator and
- * never enter this flow. Browser users need the update permission.
+ *
+ * Only users allowed to update see the banner: applying it restarts the backend
+ * service, which requires the ``update`` permission. Non-admins are not prompted.
  *
  * When the process is running as a system service (OCTOP_SERVICE_MODE is
  * set), clicking the update-now action also triggers a backend service restart so that
@@ -21,16 +28,23 @@ import styles from "./index.module.less";
 export default function PwaUpdatePrompt() {
   const { t } = useTranslation();
   const user = useCurrentUser();
-  const canUpdate = !isCompanyDesktop() && userCan(user, "update");
   const [visible, setVisible] = useState(false);
   const [serviceMode, setServiceMode] = useState<string | null>(null);
 
+  const canUpdate = userCan(user, "update");
+
   useEffect(() => {
-    if (!canUpdate) return;
-    const handler = () => setVisible(true);
+    const handler = () => {
+      try {
+        if (sessionStorage.getItem(PWA_UPDATE_DISMISSED_KEY)) return;
+      } catch {
+        // private mode / storage disabled — still allow the prompt
+      }
+      setVisible(true);
+    };
     window.addEventListener("pwa:update-ready", handler);
     return () => window.removeEventListener("pwa:update-ready", handler);
-  }, [canUpdate]);
+  }, []);
 
   // Fetch service mode once so we know whether to also restart the backend.
   useEffect(() => {
@@ -53,7 +67,14 @@ export default function PwaUpdatePrompt() {
     await applyUpdate();
   };
 
-  const handleDismiss = () => setVisible(false);
+  const handleDismiss = () => {
+    try {
+      sessionStorage.setItem(PWA_UPDATE_DISMISSED_KEY, "1");
+    } catch {
+      // ignore
+    }
+    setVisible(false);
+  };
 
   return (
     <div className={styles.banner} role="alert" aria-live="polite">

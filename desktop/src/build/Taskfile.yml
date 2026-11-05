@@ -1,6 +1,6 @@
 version: "3"
 
-# Shell UI embeds the shared React login bundle as well as HTML assets.
+# Shell UI is Go-embedded HTML (desktop/src/assets). No Vite/npm frontend.
 
 tasks:
   go:mod:tidy:
@@ -11,17 +11,14 @@ tasks:
       - go mod tidy
 
   install:frontend:deps:
-    summary: Installs login dependencies and builds the embedded-assets development server
+    summary: Builds the embedded-assets development server
     cmds:
-      - npm ci --prefix ../../dashboard --no-audit --no-fund
-      - node ../login/build.mjs
       - go build -o .task/devserver.exe ./cmd/devserver
 
   build:frontend:
-    summary: Builds and validates the shared embedded login assets
-    run: once
+    summary: No Vite build (assets embedded)
     cmds:
-      - node ../login/build.mjs
+      - echo "embedded assets; skip vite"
 
   generate:bindings:
     summary: Bindings unused (Call.ByName)

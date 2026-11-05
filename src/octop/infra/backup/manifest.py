@@ -33,8 +33,6 @@ class BackupManifest:
     includes_plugins: bool = False
     includes_knowledge: bool = False
     includes_chats: bool = True
-    includes_company_runtime_skills: bool = False
-    external_components: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         payload: dict[str, Any] = {
@@ -52,8 +50,6 @@ class BackupManifest:
             "includes_plugins": self.includes_plugins,
             "includes_knowledge": self.includes_knowledge,
             "includes_chats": self.includes_chats,
-            "includes_company_runtime_skills": self.includes_company_runtime_skills,
-            "external_components": self.external_components,
             "agents": [asdict(a) for a in self.agents],
         }
         return json.dumps(payload, indent=2, ensure_ascii=False)
@@ -80,10 +76,6 @@ class BackupManifest:
             database_driver=str(data.get("database_driver", "sqlite")),
             database_dump_format=str(data.get("database_dump_format", "sqlite_file")),
             agents=agents,
-            includes_company_runtime_skills=bool(
-                data.get("includes_company_runtime_skills", False)
-            ),
-            external_components=[str(item) for item in data.get("external_components", [])],
             includes_config=bool(data.get("includes_config", True)),
             includes_env=bool(data.get("includes_env", False)),
             includes_skill_packages=bool(data.get("includes_skill_packages", True)),

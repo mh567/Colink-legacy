@@ -13,12 +13,12 @@ reached with ``ask_agent``. This class owns the room side of that call:
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import inspect
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import fields
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -33,8 +33,10 @@ from octop_harness.teams.util import (
 )
 
 from octop.i18n import tr
-from octop.infra.agents.teams.service import is_team_agent
+from octop.i18n.domains.stream import format_stream_error
+from octop.infra.agents.teams.service import _user_may_use_member, is_team_agent
 from octop.infra.agents.threads.artifact import artifact_path_allowed, extract_artifact_paths
+from octop.infra.db.repos.agents import AgentRow
 from octop.infra.gateway.media.tool_media import tool_name_base
 from octop.infra.history.projection import (
     live_message_inputs,
@@ -75,6 +77,13 @@ _MEMBER_HITL_WAIT_SEC = 30 * 60
 _RELAY_CHUNK_TYPES = frozenset(
     {"token", "reasoning", "tool_call_chunk", "tool_result", "error", "attachment"}
 )
+
+
+def _is_decision_custom(chunk: dict[str, Any]) -> bool:
+    data = chunk.get("data")
+    return isinstance(data, dict) and data.get("kind") == "decision"
+
+
 _STREAM_SPEAKER_TYPES = frozenset(
     {
         "token",
@@ -86,6 +95,7 @@ _STREAM_SPEAKER_TYPES = frozenset(
         "slash_action",
         "hitl_required",
         "done",
+        "custom",
     }
 )
 
@@ -101,6 +111,23 @@ def host_system_prompt(row: Any, user_repo: Any) -> str:
     briefing = tr("teams.host_briefing", locale)
     custom = str(getattr(row, "system_prompt", None) or "").strip()
     return f"{custom}\n\n{briefing}".strip() if custom else briefing
+
+
+async def subscribe_with_member_catchup(
+    gateway: Any,
+    room_thread_id: str,
+    *,
+    subscribe: Callable[[], None],
+    send: Callable[[dict[str, Any]], Awaitable[None]],
+) -> None:
+    """Attach a room subscriber and replay an in-progress member answer."""
+    processor = getattr(gateway, "_processor", None)
+    teams = getattr(processor, "teams", None)
+    deliver = getattr(teams, "deliver_live_member_catchup", None)
+    if not callable(deliver):
+        subscribe()
+        return
+    await deliver(room_thread_id, subscribe=subscribe, send=send)
 
 
 class TeamManager:
@@ -125,6 +152,10 @@ class TeamManager:
         self._hitl_waiters: dict[str, asyncio.Future[list[dict[str, Any]]]] = {}
         self._peer_prompts: dict[tuple[str, str], tuple[str, str]] = {}
         self._live_host_replies: set[str] = set()
+        # Room text a member has already pushed and not yet persisted.
+        # A refresh mid-answer has no history row; the new subscriber gets this.
+        self._live_member_text: dict[str, dict[str, str]] = {}
+        self._member_wall_lock = asyncio.Lock()
 
     def replace_thread_message_repo(self, repo: Any) -> None:
         self._thread_message_repo = repo
@@ -294,6 +325,9 @@ class TeamManager:
             if event.status != "done"
             else (event.reply_text or "(empty)")
         )
+        failed = event.status == "failed"
+        if failed:
+            text = format_stream_error(text, self._locale_for(_octop_user_id(event.user_id)))
         if room:
             await self._push_room_to_channels(room, speaker, text, wrapup=True)
         live_ws = self._take_live_host_reply(room) and event.status == "done"
@@ -313,12 +347,15 @@ class TeamManager:
                 str(session.session_key),
                 text,
                 speaker_id=speaker,
+                **({"error": True} if failed else {}),
             )
             return
         if session is not None:
             return
         if room:
-            await self._publish_room_text(room, speaker, text)
+            await self._publish_room_text(
+                room, speaker, text, **({"error": True} if failed else {})
+            )
             self._thread_registry.touch_last_active(room)
             return
         logger.warning("team reply %s: no room to publish", event.inbox_id)
@@ -352,6 +389,7 @@ class TeamManager:
         reasoning_parts: list[str] = []
         relayed_visible = False
         saw_tool_call = False
+        decision_payload: dict[str, Any] | None = None
         emitted_tool_error_ids: set[str] = set()
         hold_room = self._defer_member_wall(speaker_id, member_tid, room_thread_id)
         host_id = self._room_agent_id(room_thread_id) if hold_room else ""
@@ -441,9 +479,18 @@ class TeamManager:
                         pause = chunk
                         resume_pending = None
                         break
-                    if kind in _RELAY_CHUNK_TYPES:
+                    # Host wrap-up runs the decision model. Member streams stay
+                    # off the room wall, including their custom events.
+                    decision_custom = (
+                        kind == "custom" and _is_decision_custom(chunk) and not hold_room
+                    )
+                    if decision_custom:
+                        data = chunk.get("data")
+                        if isinstance(data, dict):
+                            decision_payload = dict(data)
+                    if kind in _RELAY_CHUNK_TYPES or decision_custom:
                         relay = chunk
-                        if extra_stamp and kind in {"token", "reasoning"}:
+                        if extra_stamp and (kind in {"token", "reasoning"} or decision_custom):
                             relay = {**chunk, **extra_stamp}
                         await emit(relay)
                 if pause is None:
@@ -482,16 +529,19 @@ class TeamManager:
             )
             raise
         finally:
-            await release_held_room()
-            done: dict[str, Any] = {"type": "done"}
-            if extra_stamp:
-                done = {**done, **extra_stamp}
-            await self._relay_chunk(
-                done,
-                room_thread_id=room_thread_id,
-                member_thread_id=member_tid,
-                speaker_id=speaker_id,
-            )
+            try:
+                await release_held_room()
+                done: dict[str, Any] = {"type": "done"}
+                if extra_stamp:
+                    done = {**done, **extra_stamp}
+                await self._relay_chunk(
+                    done,
+                    room_thread_id=room_thread_id,
+                    member_thread_id=member_tid,
+                    speaker_id=speaker_id,
+                )
+            finally:
+                await self._clear_live_member(room_thread_id, speaker_id)
         stream_text = "".join(text_parts).strip()
         return {
             "messages": await self._peer_result_messages(
@@ -502,6 +552,7 @@ class TeamManager:
             ),
             "team_live_streamed": relayed_visible,
             "stream_text": stream_text,
+            "decision": decision_payload,
         }
 
     def _defer_member_wall(self, speaker_id: str, member_tid: str, room_thread_id: str) -> bool:
@@ -570,7 +621,16 @@ class TeamManager:
                 if text:
                     break
         if text:
-            self._persist_room_assistant(room_thread_id, speaker_id, text, wrapup=True)
+            decision = _decision_from_messages(result.get("messages") or [])
+            if decision is None and isinstance(result.get("decision"), dict):
+                decision = dict(result["decision"])
+            self._persist_room_assistant(
+                room_thread_id,
+                speaker_id,
+                text,
+                wrapup=True,
+                decision=decision,
+            )
         live = bool(result.get("team_live_streamed"))
         # Some models finish wrap-up in checkpoint/values only — no token
         # frames. Push the final text so the open room still sees it.
@@ -582,7 +642,10 @@ class TeamManager:
                 wrapup=True,
             )
             live = self._thread_is_watched(room_thread_id)
-        if room_thread_id and text and live:
+        # ``on_reply`` fires after this method even when nobody watches the
+        # room. Mark the reply handled once it has been persisted, otherwise
+        # the fallback path appends the same wrap-up a second time.
+        if room_thread_id and text:
             self._live_host_replies.add(room_thread_id)
         return result
 
@@ -602,9 +665,6 @@ class TeamManager:
             return
         edited = _edited_files_from_messages(stamped)
         stamped, final = _apply_edited_files_stamp(stamped, edited)
-        # The initial host turn commits its question when streaming completes.
-        # A fast member must not be stored ahead of that question on reload.
-        await self._wait_host_dispatch_idle(call.from_agent_id, str(call.source_thread_id))
         if self._thread_message_repo is not None:
             try:
                 self._thread_message_repo.append_if_ready(
@@ -957,6 +1017,64 @@ class TeamManager:
         )
         self._thread_registry.set_title_if_null(thread_id, title)
 
+    def _append_live_member(self, room_thread_id: str, speaker_id: str, piece: str) -> None:
+        room = room_thread_id.strip()
+        speaker = speaker_id.strip()
+        if not room or not speaker or not piece:
+            return
+        bucket = self._live_member_text.setdefault(room, {})
+        bucket[speaker] = bucket.get(speaker, "") + piece
+
+    async def _clear_live_member(self, room_thread_id: str, speaker_id: str) -> None:
+        room = room_thread_id.strip()
+        speaker = speaker_id.strip()
+        if not room or not speaker:
+            return
+        async with self._member_wall_lock:
+            bucket = self._live_member_text.get(room)
+            if not bucket:
+                return
+            bucket.pop(speaker, None)
+            if not bucket:
+                self._live_member_text.pop(room, None)
+
+    def _live_member_frames(self, room_thread_id: str) -> list[dict[str, Any]]:
+        room = room_thread_id.strip()
+        bucket = self._live_member_text.get(room) or {}
+        frames: list[dict[str, Any]] = []
+        for speaker, text in bucket.items():
+            if not speaker or not text:
+                continue
+            frames.append(
+                {
+                    "type": "token",
+                    "content": text,
+                    "agent_id": speaker,
+                    "agent": speaker,
+                    "team_snapshot": True,
+                    "team_live": True,
+                    "thread_id": room,
+                }
+            )
+        return frames
+
+    async def deliver_live_member_catchup(
+        self,
+        room_thread_id: str,
+        *,
+        subscribe: Callable[[], None],
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Subscribe, then replay member text that is on the wall but not in history.
+
+        The lock covers subscribe and the replay so a token cannot land twice:
+        once inside the snapshot and again as a live delta.
+        """
+        async with self._member_wall_lock:
+            subscribe()
+            for frame in self._live_member_frames(room_thread_id):
+                await send(frame)
+
     async def _relay_chunk(
         self,
         chunk: dict[str, Any],
@@ -970,9 +1088,13 @@ class TeamManager:
         if hub is None:
             return
         stamped = stamp_stream_speaker(chunk, speaker_id, include_done=True)
+        piece = str(chunk.get("content") or "") if str(chunk.get("type") or "") == "token" else ""
         try:
             if include_room and room_thread_id:
-                await hub.push_to_thread(room_thread_id, stamped)
+                async with self._member_wall_lock:
+                    await hub.push_to_thread(room_thread_id, stamped)
+                    if piece:
+                        self._append_live_member(room_thread_id, speaker_id, piece)
             if member_thread_id and member_thread_id != room_thread_id:
                 await hub.push_to_thread(member_thread_id, chunk)
         except Exception:
@@ -994,8 +1116,12 @@ class TeamManager:
         if hub is None or not room_thread_id:
             return
         stamped = stamp_stream_speaker(chunk, speaker_id, include_done=True)
+        piece = str(chunk.get("content") or "") if str(chunk.get("type") or "") == "token" else ""
         try:
-            await hub.push_to_thread(room_thread_id, stamped)
+            async with self._member_wall_lock:
+                await hub.push_to_thread(room_thread_id, stamped)
+                if piece:
+                    self._append_live_member(room_thread_id, speaker_id, piece)
         except Exception:
             logger.warning(
                 "failed to flush team room frame speaker=%s room=%s",
@@ -1189,6 +1315,8 @@ class TeamManager:
         text: str,
         *,
         wrapup: bool = False,
+        error: bool = False,
+        decision: dict[str, Any] | None = None,
     ) -> None:
         body = (text or "").strip()
         if not thread_id or not body or self._thread_message_repo is None:
@@ -1197,6 +1325,10 @@ class TeamManager:
         extra: dict[str, Any] = {"speaker_agent_id": speaker_id}
         if wrapup:
             extra["team_wrapup"] = True
+        if error:
+            extra["octop_stream_error"] = {"code": "stream_error", "source": "team_task"}
+        if decision:
+            extra["octop_decision"] = dict(decision)
         msg = AIMessage(
             content=body,
             id=f"team-room:{new_ulid()}:assistant",
@@ -1289,16 +1421,19 @@ class TeamManager:
                     exc_info=True,
                 )
 
-    async def _publish_room_text(self, thread_id: str, speaker_id: str, text: str) -> None:
+    async def _publish_room_text(
+        self, thread_id: str, speaker_id: str, text: str, *, error: bool = False
+    ) -> None:
         body = (text or "").strip()
         if not thread_id or not body:
             return
-        self._persist_room_assistant(thread_id, speaker_id, body, wrapup=True)
+        self._persist_room_assistant(thread_id, speaker_id, body, wrapup=True, error=error)
         await self._push_room_snapshot(
             thread_id,
             speaker_id,
             body,
             wrapup=True,
+            error=error,
         )
 
     async def _push_room_snapshot(
@@ -1308,6 +1443,7 @@ class TeamManager:
         text: str,
         *,
         wrapup: bool = False,
+        error: bool = False,
     ) -> None:
         body = (text or "").strip()
         if not thread_id or not body:
@@ -1320,7 +1456,11 @@ class TeamManager:
             await hub.push_to_thread(
                 thread_id,
                 stamp_stream_speaker(
-                    {"type": "token", "content": body, **extra},
+                    (
+                        {"type": "error", "message": body, **extra}
+                        if error
+                        else {"type": "token", "content": body, **extra}
+                    ),
                     speaker_id,
                 ),
             )
@@ -1352,6 +1492,7 @@ class TeamManager:
         text: str,
         *,
         speaker_id: str | None = None,
+        error: bool = False,
     ) -> None:
         if self._thread_registry.is_im_session(session):
             await self._push_session_channel(session, text)
@@ -1360,6 +1501,7 @@ class TeamManager:
             session.thread_id,
             speaker_id or session.agent_id,
             text,
+            error=error,
         )
         if not self._thread_is_watched(session.thread_id):
             self._thread_registry.increment_unread(session_key)
@@ -1541,6 +1683,23 @@ def _message_role(msg: Any) -> str:
 
 def _message_is_assistant(msg: Any) -> bool:
     return _message_role(msg) in {"ai", "assistant"}
+
+
+def _decision_from_messages(messages: Sequence[Any]) -> dict[str, Any] | None:
+    for msg in reversed(messages):
+        if not _message_is_assistant(msg):
+            continue
+        kwargs = (
+            msg.get("additional_kwargs")
+            if isinstance(msg, dict)
+            else getattr(msg, "additional_kwargs", None)
+        )
+        if not isinstance(kwargs, dict):
+            continue
+        decision = kwargs.get("octop_decision")
+        if isinstance(decision, dict):
+            return dict(decision)
+    return None
 
 
 def _message_tool_calls(msg: Any) -> Any:
@@ -1854,6 +2013,13 @@ def _patch_inbox_wrapup(
             agent_id=host_id,
             text=prompt,
             source="inbox",
+            configurable={
+                **({"octop_memory_capture_exclude": True} if error_text else {}),
+                "octop_decision_followup": True,
+                "peer_invoke_mode": "async",
+                "octop_decision_finished_member": str(getattr(msg, "target_agent_id", "") or ""),
+                "octop_decision_task": str(getattr(msg, "message", "") or ""),
+            },
         )
         try:
             reply = await stream_followup(
@@ -1871,6 +2037,176 @@ def _patch_inbox_wrapup(
     inbox._synthesize_reply = synthesize
 
 
+def _clean_peer_names(raw: Sequence[str] | None) -> tuple[str, ...] | None:
+    if raw is None:
+        return None
+    return tuple(str(item).strip().lstrip("@") for item in raw if str(item).strip())
+
+
+def _request_peer_allowlist() -> tuple[str, ...] | None:
+    from octop_harness.teams.team_manager import _request_team_peers  # noqa: PLC0415
+
+    return _clean_peer_names(_request_team_peers())
+
+
+def _shared_member_allowlist(
+    harness_team: Any,
+    *,
+    exclude_agent_id: str | None,
+    team_peers: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    """Ids a caller may pull in from outside their own account.
+
+    ``None`` means there is no allowlist (ordinary expert). An empty tuple
+    means the allowlist is present and names nobody.
+    """
+    config_allow = _clean_peer_names(harness_team._peer_allowlist(exclude_agent_id))
+    override = _clean_peer_names(team_peers)
+    if override is None:
+        override = _request_peer_allowlist()
+    if config_allow is None and override is None:
+        return None
+    if config_allow is None:
+        return override
+    if override is None:
+        return config_allow
+    allowed = set(config_allow)
+    return tuple(name for name in override if name in allowed)
+
+
+def _peer_viewer(user_id: str | int, load_user: Callable[[int], Any]) -> Any:
+    if isinstance(user_id, int):
+        uid: int | None = user_id
+    elif str(user_id).isdigit():
+        uid = int(user_id)
+    else:
+        uid = None
+    row = load_user(uid) if uid is not None else None
+    is_admin = (
+        bool(getattr(row, "is_admin", False)) or str(getattr(row, "role", "") or "") == "admin"
+    )
+    viewer_id = getattr(row, "id", None) if row is not None else uid
+    return SimpleNamespace(id=viewer_id, is_admin=is_admin)
+
+
+def _usable_shared_entry(
+    harness_team: Any,
+    agent_id: str,
+    *,
+    exclude_agent_id: str | None,
+    viewer: Any,
+    load_agent: Callable[[str], AgentRow | None],
+) -> Any | None:
+    if not agent_id or agent_id == exclude_agent_id:
+        return None
+    try:
+        entry = harness_team._registry.get(agent_id)
+    except KeyError:
+        return None
+    if entry.agent_id == exclude_agent_id:
+        return None
+    row = load_agent(entry.agent_id)
+    if row is None or is_team_agent(row) or not _user_may_use_member(row, viewer):
+        return None
+    return entry
+
+
+def wire_shared_member_peers(
+    harness_team: Any,
+    *,
+    load_agent: Callable[[str], AgentRow | None],
+    load_user: Callable[[int], Any],
+) -> None:
+    """Let a team allowlist see shared experts owned by other accounts.
+
+    Harness ``list_peers`` and ``_resolve_peer_entry`` keep same-user peers
+    only, so a host whose members were shared by someone else gets an empty
+    ``agent_list`` and ``ask_agent`` rejects the dispatch. Ids on the host
+    ``team_peers`` config, or on a member's request-scoped allowlist, are
+    added back when ``_user_may_use_member`` accepts them for the chatting user.
+    """
+    if harness_team is None or getattr(harness_team, "_octop_shared_member_peers", False):
+        return
+    original_list = getattr(harness_team, "list_peers", None)
+    original_resolve = getattr(harness_team, "_resolve_peer_entry", None)
+    if original_list is None or original_resolve is None:
+        return
+
+    def list_peers(
+        user_id: str | int,
+        *,
+        exclude_agent_id: str | None = None,
+        team_peers: Sequence[str] | None = None,
+        **kwargs: Any,
+    ) -> list[Any]:
+        peers = list(
+            original_list(
+                user_id,
+                exclude_agent_id=exclude_agent_id,
+                team_peers=team_peers,
+                **kwargs,
+            )
+        )
+        allow = _shared_member_allowlist(
+            harness_team,
+            exclude_agent_id=exclude_agent_id,
+            team_peers=team_peers,
+        )
+        if not allow:
+            return peers
+        seen = {str(getattr(entry, "agent_id", "")) for entry in peers}
+        viewer = _peer_viewer(user_id, load_user)
+        added: list[Any] = []
+        for member_id in allow:
+            if member_id in seen:
+                continue
+            entry = _usable_shared_entry(
+                harness_team,
+                member_id,
+                exclude_agent_id=exclude_agent_id,
+                viewer=viewer,
+                load_agent=load_agent,
+            )
+            if entry is None or entry.agent_id in seen:
+                continue
+            added.append(entry)
+            seen.add(entry.agent_id)
+        if added:
+            enrich = getattr(harness_team, "_apply_peer_enrich", None)
+            if callable(enrich):
+                enrich(added)
+        peers.extend(added)
+        return peers
+
+    def resolve_peer_entry(from_agent_id: str, to_agent_id: str, user_id: str | int) -> Any:
+        try:
+            return original_resolve(from_agent_id, to_agent_id, user_id)
+        except ValueError as exc:
+            if "not owned by user" not in str(exc):
+                raise
+        allow = _shared_member_allowlist(
+            harness_team,
+            exclude_agent_id=from_agent_id,
+            team_peers=None,
+        )
+        if not allow or to_agent_id not in allow:
+            raise ValueError(f"agent {to_agent_id!r} not owned by user")
+        entry = _usable_shared_entry(
+            harness_team,
+            to_agent_id,
+            exclude_agent_id=from_agent_id,
+            viewer=_peer_viewer(user_id, load_user),
+            load_agent=load_agent,
+        )
+        if entry is None:
+            raise ValueError(f"agent {to_agent_id!r} not owned by user")
+        return entry
+
+    harness_team.list_peers = list_peers
+    harness_team._resolve_peer_entry = resolve_peer_entry
+    harness_team._octop_shared_member_peers = True
+
+
 def wire_host_dispatch(
     harness_team: Any,
     *,
@@ -1882,21 +2218,6 @@ def wire_host_dispatch(
     """Patch harness TeamManager so async ``ask_agent`` uses inbox + room stream."""
     if harness_team is None:
         return
-    inbox = getattr(harness_team, "inbox", None)
-    original_start = getattr(inbox, "start", None)
-    if (
-        inbox is not None
-        and callable(original_start)
-        and not getattr(inbox, "_octop_detached_worker", False)
-    ):
-        # enqueue() lazily starts a process-wide worker. Inheriting the first
-        # host's LangGraph context leaks later member tokens into that host's
-        # stream/history. Jobs carry their explicit user and thread identity.
-        def start_detached() -> None:
-            contextvars.Context().run(original_start)
-
-        inbox.start = start_detached
-        inbox._octop_detached_worker = True
     original_call = getattr(harness_team, "call_peer", None)
 
     async def call_peer(
@@ -2033,18 +2354,21 @@ def wire_host_dispatch(
         pair = take_prompt(agent_id, getattr(req, "thread_id", None))
         if not pair:
             return req
+        from langchain_core.messages import HumanMessage, SystemMessage
+
         question, dispatch = pair
-        # An assignment is conversation input, not a new system instruction.
-        # Appending SystemMessage to a checkpoint produces a late system role,
-        # rejected by Qwen/vLLM chat templates on subsequent turns.
-        content = "\n\n".join(dict.fromkeys(part for part in (dispatch, question) if part))
-        if content:
-            req.messages = [
+        messages: list[Any] = []
+        if dispatch and dispatch != question:
+            messages.append(SystemMessage(content=dispatch))
+        if question:
+            messages.append(
                 HumanMessage(
-                    content=content,
+                    content=question,
                     id=f"team-peer:{getattr(req, 'thread_id', None)}:{new_ulid()}:human",
                 )
-            ]
+            )
+        if messages:
+            req.messages = messages
         return req
 
     harness_team._enrich_request = enrich
@@ -2056,4 +2380,5 @@ __all__ = [
     "stamp_stream_speaker",
     "stamp_team_host_chunk",
     "wire_host_dispatch",
+    "wire_shared_member_peers",
 ]

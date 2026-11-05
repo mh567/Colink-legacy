@@ -190,7 +190,6 @@ async def fork_dashboard_thread(
     locale: str = "en",
     thread_message_repo: Any | None = None,
     history_archive: Any | None = None,
-    device_repo: Any | None = None,
 ) -> dict[str, Any]:
     """Create a dashboard thread seeded through the selected assistant reply."""
     from langchain_core.messages import message_to_dict, messages_from_dict  # noqa: PLC0415
@@ -244,11 +243,6 @@ async def fork_dashboard_thread(
         last_active=0,
     )
     try:
-        if device_repo is not None:
-            from octop.infra.devices.manager import _db
-
-            if await _db(device_repo.is_file_thread, source.thread_id):
-                await _db(device_repo.mark_file_thread, dest_id)
         await write_checkpoint_messages(harness, thread_id=dest_id, messages=prefix)
         fork_turn = (
             await asyncio.to_thread(archive.begin, source.agent_id, dest_id)

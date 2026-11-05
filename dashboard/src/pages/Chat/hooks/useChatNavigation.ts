@@ -11,7 +11,6 @@ import {
   type ThreadProbeResult,
 } from "./useSessions";
 import { EMPTY_CHAT_SESSION_KEY } from "../constants";
-import { useConversationPageVisible } from "../../../hooks/useConversationPageVisible";
 
 interface UseChatNavigationParams {
   routeAgentId: string | undefined;
@@ -42,21 +41,19 @@ export function useChatNavigation({
   fetchSessions,
   refreshAgents,
 }: UseChatNavigationParams) {
-  const pageVisible = useConversationPageVisible();
   const navigate = useNavigate();
   const location = useLocation();
   // One-shot blank-chat intent from minimal nav "+" on non-chat routes.
   const preferEmptyChatRef = useRef(false);
 
   useLayoutEffect(() => {
-    if (!pageVisible) return;
     if (!(location.state as { newChat?: boolean } | null)?.newChat) return;
     preferEmptyChatRef.current = true;
     navigate(location.pathname, { replace: true, state: null });
-  }, [location.state, navigate, location.pathname, pageVisible]);
+  }, [location.state, navigate, location.pathname]);
 
   useEffect(() => {
-    if (!resolvedAgentId || !pageVisible) return;
+    if (!resolvedAgentId) return;
     if (activeThreadId) {
       if (isPendingThread(activeThreadId)) return;
       void loadHistory(activeThreadId);
@@ -66,20 +63,10 @@ export function useChatNavigation({
         clearMessages();
       }
     }
-  }, [
-    activeThreadId,
-    resolvedAgentId,
-    loadHistory,
-    clearMessages,
-    pageVisible,
-  ]);
+  }, [activeThreadId, resolvedAgentId, loadHistory, clearMessages]);
 
   const markedAgentReadRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!pageVisible) {
-      markedAgentReadRef.current = null;
-      return;
-    }
     if (!resolvedAgentId) return;
     if (markedAgentReadRef.current === resolvedAgentId) return;
     markedAgentReadRef.current = resolvedAgentId;
@@ -87,10 +74,9 @@ export function useChatNavigation({
       .markRead(resolvedAgentId)
       .then(() => refreshAgents({ silent: true }))
       .catch(() => {});
-  }, [resolvedAgentId, refreshAgents, pageVisible]);
+  }, [resolvedAgentId, refreshAgents]);
 
   useEffect(() => {
-    if (!pageVisible) return;
     const refreshBadges = () => void refreshAgents({ silent: true });
     refreshBadges();
     const intervalId = window.setInterval(refreshBadges, 10_000);
@@ -102,7 +88,7 @@ export function useChatNavigation({
       window.clearInterval(intervalId);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [refreshAgents, pageVisible]);
+  }, [refreshAgents]);
 
   useEffect(() => {
     return chatStore.onStreamEvent((event) => {
@@ -133,7 +119,6 @@ export function useChatNavigation({
   const chatUrlStateRef = useRef<{ agentId?: string; threadId?: string }>({});
 
   useEffect(() => {
-    if (!pageVisible) return;
     const prev = chatUrlStateRef.current;
     if (
       routeAgentId &&
@@ -147,10 +132,10 @@ export function useChatNavigation({
       clearMessages();
     }
     chatUrlStateRef.current = { agentId: routeAgentId, threadId };
-  }, [routeAgentId, threadId, navigate, clearMessages, pageVisible]);
+  }, [routeAgentId, threadId, navigate, clearMessages]);
 
   useEffect(() => {
-    if (!pageVisible || sessionsLoading || prefillInputRef.current) return;
+    if (sessionsLoading || prefillInputRef.current) return;
     const agent = resolvedAgentId;
     if (!agent) return;
     if (threadId) {
@@ -180,7 +165,6 @@ export function useChatNavigation({
     routeAgentId,
     navigate,
     prefillInputRef,
-    pageVisible,
   ]);
 
   const ensureThreadAttemptRef = useRef<string | null>(null);
@@ -189,8 +173,7 @@ export function useChatNavigation({
   }, [resolvedAgentId]);
 
   useEffect(() => {
-    if (!pageVisible || !resolvedAgentId || !threadId || sessionsLoading)
-      return;
+    if (!resolvedAgentId || !threadId || sessionsLoading) return;
     if (isPendingThread(threadId)) {
       if (sessions.some((s) => s.id === threadId)) {
         clearPendingThread(threadId);
@@ -209,9 +192,8 @@ export function useChatNavigation({
       return;
     }
     ensureThreadAttemptRef.current = attemptKey;
-    let cancelled = false;
     void ensureThreadInList(threadId).then((result) => {
-      if (cancelled || ensureThreadAttemptRef.current !== attemptKey) return;
+      if (ensureThreadAttemptRef.current !== attemptKey) return;
       // Only rewrite when the probe confirms absence — keep URL on found/unknown.
       if (result !== "missing") return;
       const preferred = pickPreferredSession(sessions);
@@ -224,12 +206,6 @@ export function useChatNavigation({
         navigate(`/chat/${resolvedAgentId}`, { replace: true });
       }
     });
-    return () => {
-      cancelled = true;
-      if (ensureThreadAttemptRef.current === attemptKey) {
-        ensureThreadAttemptRef.current = null;
-      }
-    };
   }, [
     resolvedAgentId,
     threadId,
@@ -237,7 +213,6 @@ export function useChatNavigation({
     sessionsLoading,
     navigate,
     ensureThreadInList,
-    pageVisible,
   ]);
 
   const resetNavForAgentSwitch = () => {

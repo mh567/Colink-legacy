@@ -23,7 +23,6 @@ describe("desktopChrome", () => {
     applyDesktopChrome(null);
     delete document.documentElement.dataset.octopDragReady;
     vi.unstubAllGlobals();
-    delete (window as Window & { _wails?: unknown })._wails;
   });
 
   it("is inactive when the Wails bridge is missing", () => {
@@ -55,36 +54,6 @@ describe("desktopChrome", () => {
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
       ),
     ).toBe("windows");
-  });
-
-  it("uses system controls on Windows when the native shell declares a titlebar", () => {
-    vi.stubGlobal("_wails", {
-      invoke: vi.fn(),
-      flags: { octopNativeTitlebar: true },
-    });
-    expect(resolveDesktopChromeStyle("Windows NT 10.0")).toBeNull();
-    expect(installDesktopWindowDrag()).toBe(false);
-    applyDesktopChrome(resolveDesktopChromeStyle("Windows NT 10.0"));
-    expect(document.documentElement.dataset.octopDesktopChrome).toBeUndefined();
-    expect(windowControlsEndSpacerPx(null, true)).toBe(0);
-  });
-
-  it("does not add HTML controls or content dragging to native macOS windows", () => {
-    const userAgent =
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) wails.io OctopNativeTitlebar/1";
-    expect(resolveDesktopChromeStyle(userAgent)).toBeNull();
-    const addEventListener = vi.fn();
-    expect(
-      installDesktopWindowDrag({
-        _wails: { invoke: vi.fn() },
-        navigator: { userAgent },
-        addEventListener,
-      } as unknown as Window),
-    ).toBe(false);
-    expect(addEventListener).not.toHaveBeenCalled();
-    applyDesktopChrome(resolveDesktopChromeStyle(userAgent));
-    expect(document.documentElement.dataset.octopDesktopChrome).toBeUndefined();
-    expect(windowControlsEndSpacerPx(null, true)).toBe(0);
   });
 
   it("reserves a trailing inset for the title row and right-edge overlays", () => {

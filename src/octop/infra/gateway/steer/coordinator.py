@@ -500,8 +500,6 @@ class SteerCoordinator:
             state = self._by_thread.get(thread_id.strip())
             if state is None or not state.queue:
                 return None
-            if state.phase == "cancelling":
-                return self._discard_locked(state, reason="turn_cancelled")
             if state.continuation_count >= STEER_CONTINUATION_CAP:
                 return self._discard_locked(state, reason="continuation_exhausted")
             items = list(state.queue)

@@ -89,14 +89,11 @@ async def test_media_provider_presets_include_all_p0_adapters(
 
     assert response.status_code == 200, response.text
     assert [item["provider"] for item in response.json()] == [
-        "openai",
         "volcengine",
         "dashscope",
         "minimax",
     ]
     presets = {item["provider"]: item for item in response.json()}
-    assert "gpt-image-2" in presets["openai"]["image_models"]
-    assert presets["openai"]["video_models"] == []
     assert "doubao-seedream-5-0-pro-260628" in presets["volcengine"]["image_models"]
     assert "doubao-seedance-2-5-260628" in presets["volcengine"]["video_models"]
     assert "wan2.7-image-pro" in presets["dashscope"]["image_models"]

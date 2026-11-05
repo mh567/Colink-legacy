@@ -7,23 +7,20 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import JSONResponse, Response
 
 from octop.api.common.agent import require_agent_row
 from octop.api.common.agent_workspace import resolve_agent_workspace_dir
 from octop.api.deps import current_user, get_server
-from octop.api.routers.chat.models import (
-    CancelThreadResponse,
-    ForkThreadBody,
-    RebindSessionBody,
-    RenameThreadBody,
-)
+from octop.api.routers.chat.models import ForkThreadBody, RebindSessionBody, RenameThreadBody
 from octop.api.routers.chat.serialize import (
     HISTORY_DEFAULT_LIMIT,
     _backfill_thread_projection,
     _clamp_history_limit,
     _load_projected_thread_messages,
 )
+from octop.i18n import error_message
 from octop.infra.agents.security.hitl_session import parse_hitl_session_policy
 from octop.infra.agents.threads.artifact import thread_artifacts_payload
 from octop.infra.agents.threads.context_breakdown import SEGMENT_KEYS, compute_context_breakdown
@@ -131,11 +128,6 @@ async def list_threads(
             "thread_id": r.thread_id,
             "title": r.title,
             "channel_type": r.channel_type,
-            **(
-                server.services.company_runtime_repo.thread_state(r.thread_id)
-                if hasattr(server.services, "company_runtime_repo")
-                else {}
-            ),
             "session_key": r.session_key,
             "last_active": r.last_active,
             "created_at": r.created_at,
@@ -250,39 +242,6 @@ async def create_thread(
     return {"thread_id": tid, "session_key": sk}
 
 
-@router.post(
-    "/agents/{agent_id}/threads/{thread_id}/cancel",
-    response_model=CancelThreadResponse,
-    summary="Request cancellation of an active thread turn",
-    description="Requires thread ownership. Requests cancellation of the current ordinary Dashboard turn, "
-    "and discards its pending steers, not separate queued tasks or HITL. "
-    "Acknowledges the request, not completion; observe the stream for termination.",
-)
-async def cancel_thread(
-    agent_id: str,
-    thread_id: str,
-    user: Any = Depends(current_user),
-    server: Any = Depends(get_server),
-) -> CancelThreadResponse:
-    _require_thread(server, agent_id, thread_id, user, as_user=None)
-    local_repo = getattr(server.services, "company_runtime_repo", None)
-    if local_repo is not None:
-        state = await asyncio.get_running_loop().run_in_executor(
-            None, local_repo.thread_state, thread_id
-        )
-        if state.get("local_task_status") == "running":
-            await asyncio.get_running_loop().run_in_executor(
-                None, local_repo.transition, state["local_task_id"], "cancel_requested"
-            )
-            return CancelThreadResponse(thread_id=thread_id, requested=True)
-    registry = server.app_runtime.agent_registry
-    active = server.app_runtime.gateway.ws_hub.is_turn_active(thread_id)
-    if active:
-        registry.get_agent(agent_id)
-        await server.app_runtime.gateway.cancel_dashboard_turn(agent_id, thread_id)
-    return CancelThreadResponse(thread_id=thread_id, requested=active)
-
-
 def _parse_csv_query(raw: str | None) -> list[str] | None:
     if raw is None:
         return None
@@ -319,11 +278,11 @@ async def get_thread_context_usage(
         mcp_servers=_parse_csv_query(mcp_servers),
         skills=_parse_csv_query(skills),
         usage_repo=server.services.usage_repo,
-        message_repo=server.services.thread_message_repo,
     )
     return {
         "max_tokens": breakdown.max_tokens,
         "used_tokens": breakdown.used_tokens,
+        "decision_saved": breakdown.decision_saved,
         "segments": [
             {"key": key, "tokens": breakdown.segments.get(key, 0)}
             for key in SEGMENT_KEYS
@@ -429,23 +388,7 @@ async def get_thread_history(
         user_id=effective_uid,
     )
     workspace_dir = _agent_facing_workspace_dir(server, agent_id)
-    local_repo = getattr(server.services, "company_runtime_repo", None)
-    local_state = {}
-    local_artifacts = []
-    local_artifact_turns = []
-    if local_repo is not None:
-        loop = asyncio.get_running_loop()
-        local_state = await loop.run_in_executor(None, local_repo.thread_state, thread_id)
-        local_artifact_turns = await loop.run_in_executor(
-            None, local_repo.artifact_turns, thread_id
-        )
-        local_artifacts = list(
-            {file["path"]: file for turn in local_artifact_turns for file in turn["files"]}.values()
-        )
     return {
-        **local_state,
-        "local_artifacts": local_artifacts,
-        "local_artifact_turns": local_artifact_turns,
         "thread_id": thread_id,
         "messages": messages,
         "has_more": has_more,
@@ -523,7 +466,6 @@ async def fork_thread(
         locale=resolve_request_locale(request),
         thread_message_repo=server.services.thread_message_repo,
         history_archive=getattr(server.app_runtime, "history_archive", None),
-        device_repo=server.services.device_repo,
     )
 
 
@@ -632,6 +574,14 @@ async def patch_thread(
                 ErrorCode.SLASH_BAD_ARGS,
                 "model_ref must reference an enabled model",
             )
+        if (
+            model_ref is not None
+            and not server.app_runtime.agent_registry.model_ref_allowed_for_user(
+                user.id,
+                model_ref,
+            )
+        ):
+            raise OctopError(ErrorCode.RESOURCE_NOT_ALLOWED, "resource is not visible to this user")
     if "reasoning_mode" in body.model_fields_set:
         reasoning_mode = body.reasoning_mode
     if "reasoning_effort" in body.model_fields_set:
@@ -674,19 +624,33 @@ async def delete_thread(
     agent_id: str,
     thread_id: str,
     as_user: int | None = None,
+    compact: bool | None = Query(default=None),
     user: Any = Depends(current_user),
     server: Any = Depends(get_server),
-) -> None:
-    """Remove a conversation thread, its actual checkpoint data, and its metadata.
+) -> Response:
+    """Remove a conversation thread, its checkpoint data, and its metadata.
 
-    Checkpoint deletion runs first: if it fails (as opposed to simply
-    finding nothing to delete — agent not running / no checkpointer),
-    the row is intentionally left in place so the thread stays visible
-    and the caller can retry, instead of orphaning undeleted data with
-    no remaining handle to it.
+    Checkpoint deletion runs first. ``CHECKPOINT_DELETE_FAILED`` leaves
+    the thread row in place so the caller can retry, instead of dropping
+    the only handle to data that is still on disk.
+
+    ``compact=true`` rebuilds the SQLite file before the response returns,
+    so the file can shrink immediately. The expert pauses while that runs.
+    ``compact=false`` only deletes the rows. It does not vacuum. Idle
+    maintenance reclaims the free space later, once the freelist is large
+    enough. Omitting ``compact`` keeps the previous empty 204.
     """
     _require_thread(server, agent_id, thread_id, user, as_user)
-    await server.app_runtime.agent_registry.delete_thread_checkpoint(agent_id, thread_id)
+    if server.app_runtime.gateway.ws_hub.is_turn_active(thread_id):
+        raise OctopError(
+            ErrorCode.THREAD_TURN_ACTIVE,
+            error_message(ErrorCode.THREAD_TURN_ACTIVE.value, "en"),
+        )
+    registry = server.app_runtime.agent_registry
+    if compact is False:
+        await registry.delete_thread_checkpoint(agent_id, thread_id, reclaim=False)
+    else:
+        await registry.delete_thread_checkpoint(agent_id, thread_id)
     server.app_runtime.gateway.thread_registry.delete_thread(thread_id)
     runtime = getattr(server, "app_runtime", None)
     trajectory = getattr(runtime, "trajectory_service", None) if runtime is not None else None
@@ -695,3 +659,13 @@ async def delete_thread(
             trajectory.delete_for_thread(thread_id)
         except Exception:
             logger.exception("trajectory cascade delete failed thread=%s", thread_id)
+    if compact is None:
+        return Response(status_code=204)
+    compacted = False
+    scheduled = False
+    if compact:
+        compact_now = getattr(registry, "compact_agent_database", None)
+        if callable(compact_now):
+            compacted = bool(await compact_now(agent_id))
+        scheduled = not compacted
+    return JSONResponse({"compacted": compacted, "scheduled": scheduled})

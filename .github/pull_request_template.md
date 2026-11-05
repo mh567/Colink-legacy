@@ -4,7 +4,8 @@
 
 ## Target branch
 
-- [ ] Base is this repository’s **`main`**
+- [ ] Base is **`develop`** (feature / fix — default)
+- [ ] Base is **`main`** (`release/*` or `hotfix/*` only)
 
 ## Type of change
 
@@ -17,9 +18,9 @@
 
 ## Test plan
 
-<!-- How did you verify this? Include commands and results for affected modules and related checks. -->
+<!-- How did you verify this? Include commands run (e.g. `make all`). -->
 
-- [ ] Relevant tests and checks pass locally (state any unverified scope)
+- [ ] `make all` passes locally
 - [ ] Added/updated tests
 
 ## Checklist

@@ -1,5 +1,3 @@
-import { isCompanyDesktop } from "@/api/desktopRuntime";
-import { useChatDeviceSelection } from "./hooks/useChatDeviceSelection";
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
@@ -15,11 +13,11 @@ import {
   Activity,
 } from "lucide-react";
 import { Alert, Button, Tooltip } from "antd";
+import cx from "classnames";
 import { message as antMessage } from "@/utils/antdMessage";
 import { showConfirmModal } from "../../utils/confirmModal";
 import PlanReadyCard from "./components/PlanReadyCard";
 import { useIsMobile } from "../../hooks/useIsMobile";
-import { useConversationPageVisible } from "../../hooks/useConversationPageVisible";
 import { useHitlEnabled } from "../../hooks/useHitlEnabled";
 import { useCurrentUser } from "../../hooks/useCurrentUser";
 import { navAllowed, userCan } from "../../utils/permissions";
@@ -81,6 +79,7 @@ import { useLayoutMode } from "../../context/LayoutModeContext";
 import { useBrowserSessionState } from "../../hooks/useBrowserSessionState";
 import { prefetchVoiceConfig } from "../../hooks/useVoiceConfig";
 import {
+  canReadAgentRuntimeStatus,
   chatSkillCatalogAgentId,
   isSharedExpertViewer,
 } from "../../utils/sharedExpert";
@@ -96,7 +95,8 @@ import {
 import ChatSidebarPanel from "./components/ChatSidebarPanel";
 import ChatTitleBar from "./components/ChatTitleBar";
 import TeamChatBadge from "./components/TeamChatBadge";
-import ComposerTodoProgress from "./components/ComposerTodoProgress";
+import RemoteExpertHint from "./components/RemoteExpertHint";
+import ChatComposerChrome from "./components/ChatComposerChrome";
 import AskQuestionCard from "./components/AskQuestionCard";
 import {
   findAutoResumableApproval,
@@ -123,7 +123,6 @@ export default function ChatPage() {
 }
 
 function ChatPageInner() {
-  const pageVisible = useConversationPageVisible();
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
@@ -137,7 +136,6 @@ function ChatPageInner() {
     threadId: threadId ?? null,
   });
   const isMobile = useIsMobile();
-  const hitlEnabled = useHitlEnabled();
   const user = useCurrentUser();
   const { layoutMode } = useLayoutMode();
   const isMinimalLayout = layoutMode === "minimal";
@@ -185,7 +183,6 @@ function ChatPageInner() {
   // user navigated here again from another page), push it imperatively so we
   // never trigger a parent re-render that could disrupt the user's editing.
   useEffect(() => {
-    if (!pageVisible) return;
     const pending = chatStore.consumePendingPrefillText();
     const val =
       pending ||
@@ -196,7 +193,7 @@ function ChatPageInner() {
       chatInputRef.current?.setPrefillText(val);
       navigate(location.pathname, { replace: true, state: {} });
     }
-  }, [location.state, location.pathname, navigate, pageVisible]);
+  }, [location.state, location.pathname, navigate]);
 
   const activeThreadId = threadId || null;
 
@@ -208,6 +205,7 @@ function ChatPageInner() {
     loading: agentsLoading,
   } = useAgent();
   const resolvedAgentId = routeAgentId || activeAgentId;
+  const hitlEnabled = useHitlEnabled(resolvedAgentId);
   const activeAgent = useMemo(
     () => agents.find((a) => a.agent_id === resolvedAgentId) ?? null,
     [agents, resolvedAgentId],
@@ -217,12 +215,6 @@ function ChatPageInner() {
     activeAgent !== null && activeAgent.config?.enable_trajectory !== false;
   const sharedExpertViewer = isSharedExpertViewer(activeAgent ?? {});
   const isTeamChat = isTeamAgent(activeAgent);
-  const { device, initializing: deviceInitializing } = useChatDeviceSelection(
-    resolvedAgentId,
-    isTeamChat ||
-      Boolean(activeAgent?.is_shared) ||
-      Boolean(activeAgent?.bridge),
-  );
   const [agentProfileOpen, setAgentProfileOpen] = useState(false);
   const [profileAgentId, setProfileAgentId] = useState<string | null>(null);
   const profileAgent = useMemo(() => {
@@ -262,7 +254,12 @@ function ChatPageInner() {
     visible: memoryMaintVisible,
     blocking: memoryMaintBlocking,
     connectionLost: memoryMaintConnectionLost,
-  } = useMemoryMaintenance(resolvedAgentId, agentChatReady && !noAgents);
+  } = useMemoryMaintenance(
+    resolvedAgentId,
+    agentChatReady &&
+      !noAgents &&
+      canReadAgentRuntimeStatus(activeAgent ?? {}, user),
+  );
   const historyMigration = useHistoryMigration(
     resolvedAgentId,
     agentChatReady && !noAgents && !sharedExpertViewer,
@@ -306,10 +303,10 @@ function ChatPageInner() {
   }, [fetchAllSessions, activeThreadId]);
 
   useEffect(() => {
-    if (pageVisible && routeAgentId && routeAgentId !== activeAgentId) {
+    if (routeAgentId && routeAgentId !== activeAgentId) {
       setActiveAgent(routeAgentId);
     }
-  }, [routeAgentId, activeAgentId, setActiveAgent, pageVisible]);
+  }, [routeAgentId, activeAgentId, setActiveAgent]);
 
   // Agent profile is agent-scoped — close when switching between two agents.
   const prevProfileAgentRef = useRef(resolvedAgentId);
@@ -358,7 +355,6 @@ function ChatPageInner() {
   const {
     messages,
     isStreaming,
-    localPreparing,
     thinkingStartedAt,
     historyLoading,
     historyError,
@@ -366,6 +362,7 @@ function ChatPageInner() {
     historyLoadingMore,
     historyRefreshing,
     historyHydrated,
+    runUsage,
     contextUsage,
     pendingPlanPath,
     liveSpeakers,
@@ -547,11 +544,6 @@ function ChatPageInner() {
     [sessions, activeThreadId],
   );
 
-  const companyHistoryReadOnly =
-    isCompanyDesktop() &&
-    composerSession?.executionLocation === "server" &&
-    Boolean(composerSession.hasMessages);
-
   const panelFilePaths = useMemo(() => {
     const fromTabs = openTabs
       .filter((tab) => tab.kind === "file")
@@ -606,16 +598,15 @@ function ChatPageInner() {
     composerSession?.hitlPolicy,
   );
 
-  const { contextMaxTokens, contextUsedTokens, contextBreakdown } =
-    useChatContextWindow(
-      messages,
-      contextUsage,
-      selectedModel,
-      availableModels,
-      activeAgent?.default_model,
-      activeModelRef,
-      activeAgent,
-    );
+  const { contextMaxTokens, contextUsedTokens } = useChatContextWindow(
+    messages,
+    contextUsage,
+    selectedModel,
+    availableModels,
+    activeAgent?.default_model,
+    activeModelRef,
+    activeAgent,
+  );
 
   const sessionUsage = useMemo(() => {
     const acc: TokenUsage = {};
@@ -635,17 +626,29 @@ function ChatPageInner() {
       if (typeof u.total_tokens === "number") {
         acc.total_tokens = (acc.total_tokens || 0) + u.total_tokens;
       }
+      if (typeof u.decision_saved === "number") {
+        acc.decision_saved = (acc.decision_saved || 0) + u.decision_saved;
+      }
     }
-    if (!acc.input_tokens && !acc.output_tokens && !acc.total_tokens) {
+    if (
+      !acc.input_tokens &&
+      !acc.output_tokens &&
+      !acc.total_tokens &&
+      !acc.decision_saved
+    ) {
       return null;
     }
     return acc;
   }, [messages]);
+  const decisionSaved =
+    (sessionUsage?.decision_saved ?? 0) +
+    (isStreaming ? runUsage?.decision_saved ?? 0 : 0);
   const sessionUsageLabel = formatRunUsage(sessionUsage, {
     input: t("chatUsage.input"),
     output: t("chatUsage.output"),
     total: t("chatUsage.total"),
     cacheHit: t("chatUsage.cacheHit"),
+    decisionSaved: t("chatUsage.decisionSaved"),
   });
 
   const { resetNavForAgentSwitch, markInitialNavDone } = useChatNavigation({
@@ -714,8 +717,6 @@ function ChatPageInner() {
   const { handleSend } = useChatSend({
     resolvedAgentId,
     activeThreadId,
-    sessions,
-    messagesLength: messages.length,
     selectedModel,
     selectedConnectors,
     selectedKnowledgeBaseIds,
@@ -723,11 +724,9 @@ function ChatPageInner() {
     reasoningEffort,
     conversationMode,
     hitlPolicy,
-    device,
     defaultModel: activeAgent?.default_model ?? null,
     sendMessage,
     createSession,
-    renameSession,
     onAutoRecordingStarted: useCallback((recordingId: string) => {
       setBrowserRecording(true);
       setBrowserRecordingId(recordingId);
@@ -821,7 +820,6 @@ function ChatPageInner() {
         selectedTargetAgents: item.composerContext?.targetAgents,
         threadId: ctx.threadId,
         agentId: ctx.agentId || undefined,
-        device: item.device ?? null,
       });
       if (!ok) {
         antMessage.error(t("chat.queue.flushFailed"));
@@ -877,14 +875,6 @@ function ChatPageInner() {
         attachments: item.attachments,
       });
       if (result === "empty") return;
-      if (
-        result === "unsupported" ||
-        result === "not_ready" ||
-        result === "attachments"
-      ) {
-        antMessage.warning(t(`chat.steer.local_${result}`));
-        return;
-      }
       removeQueued(id);
       if (result === "no_socket") {
         wrappedHandleSend(item.text, item.attachments);
@@ -896,7 +886,6 @@ function ChatPageInner() {
       queuedItems,
       removeQueued,
       wrappedHandleSend,
-      t,
     ],
   );
 
@@ -944,7 +933,6 @@ function ChatPageInner() {
   }, [clearQueued, startNewChat]);
 
   useEffect(() => {
-    if (!pageVisible) return;
     return chatStore.onSlashAction((ev) => {
       if (ev.action === "switch_agent" && ev.agent_id) {
         navigateToAgent(ev.agent_id);
@@ -956,7 +944,7 @@ function ChatPageInner() {
         handleConversationModeChange(ev.mode);
       }
     });
-  }, [navigateToAgent, handleConversationModeChange, pageVisible]);
+  }, [navigateToAgent, handleConversationModeChange]);
 
   const handlePromptClick = useCallback(
     (text: string, options?: { prefill?: boolean }) => {
@@ -1382,26 +1370,22 @@ function ChatPageInner() {
         closeToolUiPanel={closeToolUiPanel}
         focusToolUiPanel={focusToolUiTab}
       >
-        {pageVisible && chatHistoryRail
+        {chatHistoryRail
           ? createPortal(chatSidebarPanel, chatHistoryRail)
           : null}
         <div
-          className={`${styles.chatPage} ${
-            dockIsResizing ? styles.panelResizeActive : ""
-          } ${
-            dockOpen && dockMode === "bottom"
-              ? styles.chatPageWithBottomDock
-              : ""
-          }`}
+          className={cx(
+            styles.chatPage,
+            dockIsResizing && styles.panelResizeActive,
+            dockOpen && dockMode === "bottom" && styles.chatPageWithBottomDock,
+          )}
         >
           {/* Main chat area */}
           <div
-            className={[
+            className={cx(
               styles.chatMain,
-              turnRailVisible ? styles.chatMainWithTurnRail : "",
-            ]
-              .filter(Boolean)
-              .join(" ")}
+              turnRailVisible && styles.chatMainWithTurnRail,
+            )}
           >
             {/* Mobile toolbar — session list + optional title + agent profile */}
             {isMobile && (
@@ -1428,6 +1412,7 @@ function ChatPageInner() {
                       {activeSessionTitle}
                     </span>
                     <TeamChatBadge show={isTeamChat} />
+                    <RemoteExpertHint agent={activeAgent} />
                   </div>
                 )}
                 {resolvedAgentId && !sharedExpertViewer && (
@@ -1493,6 +1478,7 @@ function ChatPageInner() {
                 forkDisabled={sessionForkDisabled}
                 forkDisabledHint={sessionForkDisabledHint}
                 isTeam={isTeamChat}
+                agent={activeAgent}
               />
             )}
 
@@ -1573,14 +1559,9 @@ function ChatPageInner() {
                     isStreaming={isStreaming}
                     liveSpeakers={liveSpeakers}
                     thinkingStartedAt={thinkingStartedAt}
-                    localPreparing={localPreparing}
                     sessionKey={activeThreadId ?? undefined}
                     onRegenerate={handleRegenerate}
-                    onDisableStreamUsage={
-                      userCan(user, "providers")
-                        ? handleDisableStreamUsage
-                        : undefined
-                    }
+                    onDisableStreamUsage={handleDisableStreamUsage}
                     onEditUserMessage={handleEditUserMessage}
                     onWithdrawSteer={handleWithdrawSteer}
                     onForkAssistantMessage={handleForkAssistantMessage}
@@ -1742,29 +1723,27 @@ function ChatPageInner() {
                     <span className={styles.chatFloatBtnWrap}>
                       <button
                         type="button"
-                        className={[
+                        className={cx(
                           styles.browserStatusBtn,
-                          browserSessionId ? styles.browserStatusActive : "",
+                          browserSessionId && styles.browserStatusActive,
                           browserSessionId &&
-                          (browserSessionState === "awaiting_user_auth" ||
-                            browserSessionState === "authenticating")
-                            ? styles.browserStatusAuth
-                            : "",
-                          browserSessionId && browserControlOwner === "user"
-                            ? styles.browserStatusTakeover
-                            : "",
-                        ]
-                          .filter(Boolean)
-                          .join(" ")}
+                            (browserSessionState === "awaiting_user_auth" ||
+                              browserSessionState === "authenticating") &&
+                            styles.browserStatusAuth,
+                          browserSessionId &&
+                            browserControlOwner === "user" &&
+                            styles.browserStatusTakeover,
+                        )}
                         onClick={() => void handleToggleBrowserPanel()}
                         aria-label={t("chat.openBrowser")}
                       >
                         <Globe size={20} strokeWidth={2.1} />
                         {browserSessionId && (
                           <span
-                            className={`${styles.browserStatusDot} ${
-                              styles[`browserStatus_${browserControlOwner}`]
-                            }`}
+                            className={cx(
+                              styles.browserStatusDot,
+                              styles[`browserStatus_${browserControlOwner}`],
+                            )}
                           />
                         )}
                       </button>
@@ -1773,6 +1752,7 @@ function ChatPageInner() {
                 </div>
               )}
 
+            <ChatComposerChrome sessionUsageLabel={sessionUsageLabel} />
             {pendingAsk ? (
               <div className={styles.askQuestionDock}>
                 <div className={styles.askQuestionDockInner}>
@@ -1842,28 +1822,10 @@ function ChatPageInner() {
                 </div>
               </div>
             ) : null}
-            {companyHistoryReadOnly && (
-              <Alert
-                type="info"
-                showIcon
-                message="此会话的历史由服务器执行，仅供查看。请新建会话开始本机任务。"
-                action={<Button onClick={handleNewChat}>新建本机会话</Button>}
-              />
-            )}
-            <div className={styles.todoProgressDock}>
-              <div className={styles.todoProgressDockInner}>
-                <ComposerTodoProgress
-                  key={`${resolvedAgentId}:${activeThreadId}`}
-                  messages={messages}
-                  isStreaming={isStreaming || membersStillTalking}
-                  hostAgentId={resolvedAgentId}
-                />
-              </div>
-            </div>
             <ChatInput
               ref={chatInputRef}
               onSend={wrappedHandleSend}
-              onQueue={(item) => enqueueQueued({ ...item, device })}
+              onQueue={enqueueQueued}
               queuedItems={displayQueuedItems}
               onRemoveQueued={removeQueued}
               onReclaimQueued={reclaimQueued}
@@ -1874,12 +1836,11 @@ function ChatPageInner() {
               holdSend={membersStillTalking}
               isTeam={isTeamChat}
               disabled={
-                companyHistoryReadOnly ||
                 !agentChatReady ||
                 noAgents ||
                 memoryMaintBlocking ||
-                deviceInitializing ||
-                Boolean(device && (!device.device_id || !device.grant_id))
+                !modelsReady ||
+                availableModels.length === 0
               }
               initialText={prefillInputRef.current}
               onComposerCleared={() => {
@@ -1922,8 +1883,7 @@ function ChatPageInner() {
               defaultModel={activeAgent?.default_model ?? null}
               contextUsedTokens={contextUsedTokens}
               contextMaxTokens={contextMaxTokens}
-              contextBreakdown={contextBreakdown}
-              sessionUsageLabel={sessionUsageLabel}
+              decisionSaved={decisionSaved}
             />
           </div>
 
@@ -1953,7 +1913,7 @@ function ChatPageInner() {
 
           {!sharedExpertViewer && (
             <AgentProfileDrawer
-              open={pageVisible && agentProfileOpen}
+              open={agentProfileOpen}
               agent={profileAgent}
               isMobile={isMobile}
               onClose={() => {
@@ -1966,7 +1926,7 @@ function ChatPageInner() {
             <TrajectoryDrawer
               agentId={resolvedAgentId ?? ""}
               threadId={activeThreadId}
-              open={pageVisible && trajectoryDrawerOpen}
+              open={trajectoryDrawerOpen}
               onClose={() => setTrajectoryDrawerOpen(false)}
             />
           )}

@@ -1,17 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Spin } from "antd";
-import {
-  AUTH_TOKEN_CHANGED_EVENT,
-  clearAuthToken,
-  getAuthToken,
-} from "../api/request";
+import { clearAuthToken, getAuthToken } from "../api/request";
 import { authApi, type OctopUser } from "../api/modules/auth";
 import { applyUserLocale } from "../utils/locale";
 import { isNetworkFetchError } from "../utils/networkError";
 import { CurrentUserProvider } from "../hooks/useCurrentUser";
 import BootOfflinePanel from "./BootOfflinePanel";
-import { tokenSessionIdentity } from "../utils/authSession";
 
 interface AuthGuardProps {
   children: React.ReactNode;
@@ -34,7 +29,7 @@ interface AuthGuardProps {
  * When the backend is unreachable (offline / Failed to fetch), show an
  * explicit offline panel with Retry instead of mounting a blank shell.
  *
- * Auth is checked on mount, session changes and explicit offline retry. Do not put
+ * Auth is checked on mount and on explicit offline retry only. Do not put
  * ``navigate`` in the effect deps: under ``BrowserRouter``, React Router's
  * navigate identity changes with the location, which would re-run the gate
  * on every sidebar click and flash a full-page spinner.
@@ -49,26 +44,6 @@ export default function AuthGuard({ children }: AuthGuardProps) {
   const [user, setUser] = useState<OctopUser | null>(null);
   const [offline, setOffline] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
-  const [identity, setIdentity] = useState(() =>
-    tokenSessionIdentity(getAuthToken()),
-  );
-
-  useEffect(() => {
-    const changed = () => {
-      const next = tokenSessionIdentity(getAuthToken());
-      if (next === identity) return;
-      setChecking(true);
-      setAuthed(false);
-      setUser(null);
-      setIdentity(next);
-    };
-    window.addEventListener(AUTH_TOKEN_CHANGED_EVENT, changed);
-    window.addEventListener("storage", changed);
-    return () => {
-      window.removeEventListener(AUTH_TOKEN_CHANGED_EVENT, changed);
-      window.removeEventListener("storage", changed);
-    };
-  }, [identity]);
 
   useEffect(() => {
     let cancelled = false;
@@ -104,7 +79,7 @@ export default function AuthGuard({ children }: AuthGuardProps) {
         try {
           const me = await authApi.me();
           await applyUserLocale(me.locale);
-          if (!cancelled && tokenSessionIdentity(getAuthToken()) === identity) {
+          if (!cancelled) {
             setUser(me);
             setAuthed(true);
             setChecking(false);
@@ -136,7 +111,7 @@ export default function AuthGuard({ children }: AuthGuardProps) {
     return () => {
       cancelled = true;
     };
-  }, [retryKey, identity]);
+  }, [retryKey]);
 
   if (offline) {
     return (

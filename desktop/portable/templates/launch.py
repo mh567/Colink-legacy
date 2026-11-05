@@ -34,6 +34,12 @@ def _bootstrap() -> Path:
 
     # Process .pth files (required for pywin32 layout).
     site.addsitedir(str(packages))
+    # Python subprocesses do not inherit additions to the parent's sys.path.
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    if str(packages) not in pythonpath.split(os.pathsep):
+        os.environ["PYTHONPATH"] = (
+            str(packages) + os.pathsep + pythonpath if pythonpath else str(packages)
+        )
 
     if sys.platform == "win32":
         dll_dir = packages / "pywin32_system32"
@@ -52,10 +58,6 @@ def _bootstrap() -> Path:
 
 def main() -> None:
     _bootstrap()
-    if sys.argv[1:2] == ["company-runtime"]:
-        sys.argv = [sys.argv[0], *sys.argv[2:]]
-        runpy.run_module("octop.company_runtime", run_name="__main__", alter_sys=True)
-        return
     # ``python launch.py …`` → same as ``python -m octop …``
     sys.argv = [sys.argv[0], *sys.argv[1:]]
     runpy.run_module("octop", run_name="__main__", alter_sys=True)

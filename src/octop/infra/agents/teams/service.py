@@ -69,9 +69,7 @@ def team_icon_url(stored: str | None) -> str:
 
 
 def _user_may_use_member(row: AgentRow, user: Any) -> bool:
-    from octop.infra.backend.isolation import isolation_enabled
-
-    if getattr(user, "is_admin", False) and not isolation_enabled():
+    if getattr(user, "is_admin", False):
         return True
     if row.user_id is not None and row.user_id == getattr(user, "id", None):
         return True
@@ -253,20 +251,6 @@ class TeamService:
 
     def replace_members(self, team_agent_id: str, member_ids: list[str]) -> None:
         self._write_manifest(team_agent_id, list(member_ids))
-
-    async def resolve_member_ids(
-        self, user: Any, member_ids: list[str], registry: Any
-    ) -> list[str]:
-        """Materialize shared templates as the team's owner's private experts."""
-        from octop.infra.backend.isolation import isolation_enabled
-
-        members = self.validate_member_ids(user, member_ids)
-        if not isolation_enabled():
-            return members
-        resolved = [
-            (await registry.instantiate_shared(member, user.id)).agent_id for member in members
-        ]
-        return self.validate_member_ids(user, list(dict.fromkeys(resolved)))
 
     def drop_member(self, member_id: str) -> list[str]:
         """Remove an expert from every team roster. Returns changed team ids."""

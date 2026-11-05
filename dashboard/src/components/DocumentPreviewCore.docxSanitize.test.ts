@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { clampAbsurdDocxCssLengths } from "./DocumentPreviewCore";
 
-vi.mock("./PdfDocumentPreview", () => ({
-  default: () => null,
-  PdfViewerSkeleton: () => null,
+vi.mock("react-pdf", () => ({
+  Document: () => null,
+  Page: () => null,
+  pdfjs: { GlobalWorkerOptions: {} },
 }));
 
 describe("clampAbsurdDocxCssLengths", () => {

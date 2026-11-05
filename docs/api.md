@@ -4,22 +4,6 @@ Every route is mounted under `/api`. JSON unless otherwise noted; SSE
 endpoints emit `text/event-stream`; chat turns use a WebSocket
 described in [Chat (WebSocket)](#chat-websocket).
 
-Company communication additions:
-
-| Method | Path | Permission | Behavior |
-|--------|------|------------|----------|
-| `GET` | `/im/conversations/{id}/messages/{message_id}` | messaging | Original-message preview, respecting membership and cleared history; recalled messages return a tombstone |
-| `DELETE` | `/im/conversations/{id}` | messaging | Hide and clear only the caller's view; other members keep their history, and new messages reopen the conversation |
-| `GET/POST` | `/im/organization/job-titles` | departments | List reusable titles, or create/reuse a trimmed title (1–40 characters) |
-| `PUT` | `/im/organization/users/{id}/job-title` | departments | Assign `job_title_id`, or `null` to remove the display title; no permission changes |
-| `POST` | `/agents/{id}/private-instance` | authenticated | Reuse a shared expert as the caller's private instance; returns `agent_id` |
-
-Message pages include `reply_preview` only when the referenced message is still
-visible. Directory contacts include `is_admin`, `job_title_id` and `job_title`;
-administrators are excluded from the company tree and headcounts. In operator
-isolation mode Agent list items include `isolated` and `requires_private_instance`.
-See [employee isolation](employee-isolation.md) for storage and execution boundaries.
-
 > **Interactive docs** (Scalar) live at `/api/docs` when
 > `enable_api_docs=true` (or `OCTOP_ENABLE_API_DOCS=1`). The schema
 > is at `/api/openapi.json`.
@@ -31,6 +15,10 @@ See [employee isolation](employee-isolation.md) for storage and execution bounda
 | `Authorization` | `Bearer <access_token>` from `POST /api/auth/login` |
 
 Tokens expire after `OCTOP_ACCESS_TOKEN_TTL` seconds (default 24 h).
+An authenticated request renews the token once less than two-thirds of that
+lifetime remains, so active use extends the session from the last renewal.
+Changing the password invalidates outstanding tokens; the change-password
+response returns a replacement in `X-Octop-Access-Token`.
 Rotating the JWT secret (`octop admin rotate-jwt-secret`) invalidates
 every outstanding token immediately. Login attempts are rate-limited
 (`OCTOP_LOGIN_MAX_ATTEMPTS` / `OCTOP_LOGIN_LOCKOUT_SECONDS`); the
@@ -45,31 +33,15 @@ admin can clear the lockout with `POST /api/users/{id}/unlock-login`.
 
 ### Public endpoints (no token)
 
-`/api/docs`, `/api/openapi.json`, `/api/health`, `/api/health/ready`, `/api/setup/*`,
+`/api/docs`, `/api/openapi.json`, `/api/health`, `/api/setup/*`,
 `/api/auth/login`, `/api/auth/captcha`, `/api/auth/oidc/status`, `/api/auth/oidc/start`,
 `/api/auth/oidc/callback`, `/api/auth/oidc/exchange`, `/api/auth/oauth/status`,
 `/api/auth/oauth/start`, `/api/auth/oauth/callback`, `/api/auth/oauth/exchange`,
-`/api/auth/ldap/status`, `/api/auth/invite/validate`, `/api/auth/invite/redeem`,
-`/api/i18n/*`, and `/api/connectors/oauth/callback`.
-
-Company runtime endpoints under `/api/company-runtime/*` use device credentials
-rather than account JWTs. Internal MCP endpoints under `/api/internal/mcp/*`
-also use their own authentication. Health routes bypass JWT middleware, but
-`/api/health/storage` still requires an administrator through its route dependency.
-Other routes are JWT-gated by `api/middleware/jwt_auth.py`; the setup lockdown middleware
+`/api/auth/ldap/status`, `/api/auth/passkey/status`,
+`/api/connectors/oauth/callback`, and `/api/internal/mcp/*`. All other routes are JWT-gated by
+`api/middleware/jwt_auth.py`; the setup lockdown middleware
 (`api/middleware/setup_lockdown.py`) additionally blocks non-setup
 routes until the wizard finishes.
-
-`GET /api/company-runtime/capabilities` advertises `checkpoint_batches` for the
-desktop worker. `POST /api/company-runtime/tasks/{task_id}/checkpoint-batch`
-accepts 1–64 ordered `put`/`writes` operations and commits them atomically for
-the owning device and latest task. Repeating an acknowledged batch is safe;
-conflicting checkpoint identities roll back the batch. Running, cancellation-requested
-and unknown tasks may receive pending writes; finished tasks reject new writes.
-The existing individual checkpoint endpoints remain available to older clients.
-Task creation also accepts `reasoning_mode`, `reasoning_effort` and
-`conversation_mode`; model and tool policy are still enforced by the server
-and local engine rather than supplied as arbitrary provider parameters.
 
 Password login may require a vendor captcha token. `GET /api/auth/captcha`
 returns `{provider: "slider"}` by default (dashboard slider only; no server
@@ -128,19 +100,15 @@ does not set these headers itself.
 | `PUT`    | `/auth/oauth/providers/{kind}` | admin | Upsert provider config; `client_secret` is write-only; WeCom uses `extra.agent_id` |
 | `POST`   | `/auth/oauth/providers/{kind}/test` | admin | Test provider credentials |
 | `GET`    | `/auth/ldap/status` | public | `{enabled, display_name}` for the login page hint |
+| `GET`    | `/auth/passkey/status` | public | `{passwordless_login}` — whether the login page offers “Sign in with a passkey”. Default `false` until an admin enables it |
 | `GET`    | `/auth/ldap/config` | admin | Directory settings; `bind_password` is never returned (`has_bind_password` instead) |
 | `PUT`    | `/auth/ldap/config` | admin | Upsert directory settings; `bind_password` is write-only (omit to keep the stored one) |
 | `POST`   | `/auth/ldap/config/test` | admin | Service bind + probe of `user_base_dn` → `{ok, detail}` |
 | `POST`   | `/auth/logout` | user | `204` |
 | `GET`    | `/auth/me` | user | `{id, username, role, display_name, locale, ...}` |
 | `PATCH`  | `/auth/me` | user | body `{display_name?, locale?, ...}` |
-| `POST`   | `/auth/change-password` | user | body `{old_password, new_password}` → `204`. Accounts without a local password (directory/SSO-provisioned) get `PASSWORD_NOT_SET` |
+| `POST`   | `/auth/change-password` | user | body `{old_password, new_password}` → `204`, with a replacement access token in `X-Octop-Access-Token`. Outstanding tokens stop working. Accounts without a local password (directory/SSO-provisioned) get `PASSWORD_NOT_SET` |
 | `GET`    | `/health` | public | `{status: "ok", version}` |
-
-Logout revokes the current login session, including tokens already renewed in
-another tab and communication realtime tickets. Revoked tokens are rejected by
-authenticated HTTP endpoints and new WebSocket handshakes; other login sessions
-remain valid. Active communication sockets recheck revocation every second.
 
 ## Users (admin)
 
@@ -178,8 +146,14 @@ remain valid. Active communication sockets recheck revocation every second.
 Skill copy operations create snapshots; they do not keep the source and
 destination synchronized after the request completes.
 
+Packages default to private (`shared=false`): only the creator (and admins) can
+list or open them. When `shared=true`, other users with the `skill_packages`
+permission can view and mount them; only the creator/admin can edit. `copy_policy`
+and `allow_download` still apply to users who can already view the package.
+
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
+| `GET` | `/skill-packages` | user (`skill_packages`) | Own packages + shared packages; admins see all |
 | `GET` | `/skill-packages?writable_only=true` | user (`skill_packages`) | List only packages the current user may modify; admins may modify all packages |
 | `POST` | `/agents/{id}/skill-packages/{package_id}/copy` | owner (`skill_packages`) | body `{skill_slugs: string[], overwrite?: boolean}`; copy selected package skills into the workspace |
 | `POST` | `/agents/{id}/skills/{slug}/push-to-package` | owner (`skill_packages`) | body `{package_id, overwrite?: boolean}`; copy a workspace skill into a package created by the user (or any package for admins) |
@@ -190,8 +164,17 @@ destination synchronized after the request completes.
 |------|------|-------|
 | `WS /agents/{id}/chat/ws?token=<jwt>` | owner | Primary dashboard turn endpoint. Send `{"type":"user_turn", ...}` frames (optional `hitl_policy` is a thread-scoped tool-approval bypass); server replies with harness stream chunks ending in `{"type":"done"}` or `{"type":"error","message":"..."}`. `{"type":"ping"}` → `{"type":"pong"}`. `{"type":"subscribe","thread_id"}` → `{"type":"turn_status","thread_id","active"}` plus a `steer.queue_snapshot` baseline (attach to an in-flight turn without cancelling on disconnect). `{"type":"cancel","thread_id"}` stops the active turn and discards its queued steers (explicit stop; disconnect alone does **not** cancel). See [Mid-turn steering](#mid-turn-steering) for steer frames. |
 | `GET /agents/{id}/chat/welcome` | agent access | `{welcome_message, quick_prompts, task_examples}`; `task_examples` is `null` when the workspace field is absent |
-| `POST /agents/{id}/chat/polish` | owner | body `{text, default_model?}` → `{text}` (one-shot prompt refinement) |
-| `POST /agents/{id}/chat/hitl/resume` | owner | body `{thread_id, decisions: [...], pending_id?, hitl_policy?}` → SSE chunk stream; finishes with `{"type":"done"}`. Supply the card's `pending_id` when multiple team approvals are pending so another member's request is never resumed accidentally. When the resume stops on another approval, the done frame is `{"type":"done","hitl_paused":true}` and parked steers stay queued. Optional `hitl_policy` (`ask` / `allow_all` / `allow_tools`) is a thread-scoped bypass and does not change global tool-approval settings. |
+| `POST /text/assist` | JWT | Unified polish/generate: body `{kind, text?, context?, locale?, default_model?, agent_id?}` → `{text}`. Form kinds require `context.name`; `chat.prompt` requires `text`. Model defaults to automatic routing. |
+| `POST /agents/{id}/chat/polish` | owner | **Deprecated** compat alias for `POST /text/assist` with `kind=chat.prompt` |
+| `POST /agents/{id}/chat/hitl/resume` | owner | body `{thread_id, decisions: [...], hitl_policy?}` → SSE chunk stream; finishes with `{"type":"done"}`. When the resume stops on another approval, the done frame is `{"type":"done","hitl_paused":true}` and parked steers stay queued. Optional `hitl_policy` (`ask` / `allow_all` / `allow_tools`) is a thread-scoped bypass and does not change global tool-approval settings. |
+
+Model calls retain LangChain's default retry eligibility and the configured
+retry budget/backoff. Exhausted calls raise and remain failed
+checkpoint tasks, without a synthetic assistant reply. WebUI, IM and team tasks
+display the failure separately. Team rooms publish an `error` frame followed by
+`done`; stored error bubbles carry `additional_kwargs.octop_stream_error` for
+history display. These diagnostics and automatic team failure notifications do
+not become long-term memory.
 
 ### Legacy SSE
 
@@ -229,35 +212,7 @@ after the approval resumes, and only when that resume does not stop on a new
 approval card. A park older than 30 minutes is discarded (`park_expired`).
 `{"type":"steer_remove",...}` withdraws one queued item before it drains. The client puts the draft back only after `steer.ack` with `status: "removed"` and without `already_drained`; an already-drained item stays in the continuation.
 
-### Company desktop steering
-
-Company tasks use the existing authenticated native IPC, without opening a server
-chat WebSocket. `window.__octopRuntime.steer({thread_id, text, expected_turn_id,
-client_pending_id})` inserts text into the active local task; `removeSteer({thread_id,
-turn_id, client_pending_id, pending_id})` withdraws an undrained input. Both methods
-are optional on protocol version 1 so older shells keep their existing queue and
-receive an update hint instead of starting or cancelling another task.
-
-Local lifecycle notifications use `{event:"steer", thread_id, frame}` with the
-same `turn.*`, `steer.*`, and canonical `user` frame semantics as the WebSocket
-path. Canonical user frames include `client_pending_ids`, so settling an earlier
-batch preserves newer pending inputs. The final native `done` event still waits
-for company history and artifact persistence before releasing the composer.
-
-The local path accepts text only; refer to files in the selected workspace rather
-than inserting uploaded attachments. Tools finish before a continuation is
-injected, and the same remote checkpoint and local operation receipts are reused.
-Pure-text replies finish before draining. A stopped or failed task does not run
-pending corrections. Company memory remains on the server.
-
 ## Threads & history
-
-`POST /agents/{id}/threads/{thread_id}/cancel` requires the current user's thread ownership
-and no request body. Returns `{thread_id, requested}`: `true` means the cancellation entry
-was called for a hub-active ordinary Dashboard turn, **not** that it has stopped; `false`
-means no such active turn was detected. Observe stream termination or re-subscribe for
-`turn_status`. Pending steers for that active turn are discarded. This does not cancel separate queued tasks/HITL or roll back external side effects,
-does not identify an earlier turn, and must not be automatically retried.
 
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
@@ -312,6 +267,8 @@ plugin returns a large `octop_ui` payload, the backend offloads the envelope's
 | `GET`    | `/settings/hitl` | user | `{enabled, tool_guard_require_approval, show_approval_ui}` — `show_approval_ui` is true when tool HITL is on or command guard is `require_approval` |
 | `GET`    | `/settings/captcha` | `captcha` | `{active, available, providers, source, v3_min_score}`; secrets omitted |
 | `PUT`    | `/settings/captcha` | `captcha` | merge `{active?, providers?}`; empty secret keeps ciphertext; `null` removes a pair |
+| `GET`    | `/settings/webauthn` | `captcha` | `{rp_id, origins, passwordless_login}`; `passwordless_login` defaults to `false` |
+| `PUT`    | `/settings/webauthn` | `captcha` | merge `{rp_id?, origins?, passwordless_login?}`; omitted fields keep the stored value |
 | `GET`    | `/cron/settings` | user | compat alias of `/settings/timezone` |
 | `GET`    | `/agents/{aid}/cron/examples` | agent access | `{task_examples}` from workspace `.octop/manifest.json` (`{zh,en}` string arrays, display-normalized to 3 or 6); `null` if the field is absent (dashboard keeps default cards). Prefer `GET /agents/{aid}/chat/welcome` which includes the same field. |
 | `GET`    | `/agents/{aid}/cron` | owner only | list cron rows; non-owners (including admin) get `[]` |
@@ -325,9 +282,13 @@ plugin returns a large `octop_ui` payload, the backend offloads the envelope's
 `"agent"` (run the prompt through the LLM and push the reply).
 Default: `"agent"`. `trigger` accepts cron expressions
 (`"0 9 * * *"`) plus the `interval:N` / `date:ISO8601` aliases
-documented in `infra/cron/trigger.py`. `prompt` must be non-empty and
-≤ 2000 characters. `name` is an optional display label; when omitted,
-the server derives one from `prompt`.
+documented in `infra/cron/trigger.py`. A `date:` job runs once and
+then disables itself, whether the run succeeds or fails; the row stays
+in the list. If the process is down for more than 24 hours past that
+time and the job never ran, `last_status` is `missed` and the job is
+disabled. `prompt` must be non-empty and ≤ 2000 characters. `name` is
+an optional display label; when omitted, the server derives one from
+`prompt`.
 
 ## Providers
 
@@ -341,12 +302,6 @@ the server derives one from `prompt`.
 | `POST`   | `/admin/providers` | admin | same body as user POST; row has `user_id = NULL` |
 | `PATCH`  | `/admin/providers/{id}` | admin | as user PATCH but works on shared rows |
 | `DELETE` | `/admin/providers/{id}` | admin | `204` |
-
-Provider responses include `stream_usage`. Set it with
-`PATCH /admin/providers/{id}` to control `stream_options.include_usage` without
-overwriting other provider options. New custom providers default to `false`;
-built-in presets default to `true`. Enable it only when the deployed provider supports streaming usage; the
-cumulative-usage compatibility handling also applies to enterprise local models.
 
 ## Models
 
@@ -418,10 +373,14 @@ Bundled experts live in `src/octop/infra/agents/experts/library/`
 | `POST`   | `/agents/{aid}/workspace/rename` | owner | rename / move |
 | `POST`   | `/agents/{aid}/workspace/upload` | owner | multipart upload → backend (not `max_upload_mb`) |
 | `GET`    | `/agents/{aid}/workspace/download` | owner | download a file |
+| `GET`    | `/agents/{aid}/workspace/mention-index` | owner | bounded `@` file names via the workspace backend (`truncated` when capped; short cache) |
 | `GET`    | `/agents/{aid}/workspace/glob` | owner | glob backend paths |
 | `GET`    | `/agents/{aid}/workspace/grep` | owner | grep backend files |
 | `GET`    | `/agents/{aid}/workspace/...` | owner | see `api/routers/workspace.py` |
 | `GET`    | `/agents/{aid}/skills` | owner | list installed skills |
+| `GET`    | `/agents/{aid}/skills/{slug}/export` | owner | download one workspace skill as a ZIP (`{slug}/SKILL.md` plus siblings) |
+| `POST`   | `/agents/{aid}/skills/export` | owner | body `{slugs: string[]}`; one ZIP, each slug a top-level folder |
+| `GET`    | `/skill-packages/{id}/export` | user (`skill_packages`) | download every skill in the package as one ZIP. `allow_download=false` returns 403 for users other than the creator and admins |
 | `PUT`    | `/agents/{aid}/skills/{slug}` | owner | enable / disable a skill |
 | `GET`    | `/agents/{aid}/skills/hub/search` | user | Skill Hub search |
 | `GET`    | `/agents/{aid}/skills/hub/rankings` | user | Skill Hub rankings |
@@ -434,10 +393,84 @@ Bundled experts live in `src/octop/infra/agents/experts/library/`
 | `GET`    | `/agents/{aid}/heartbeat-config` | owner | read heartbeat YAML |
 | `PUT`    | `/agents/{aid}/heartbeat-config` | owner | write heartbeat YAML |
 | `GET`    | `/agents/{aid}/memory/daily` | owner | list daily memory files |
+| `GET`/`PUT` | `/agents/{aid}/memory/strong` | owner | read/edit user-maintained MEMORY.md, including for stopped agents; new sessions snapshot full content once, existing sessions keep their snapshot |
+| `GET`/`PUT` | `/agents/{aid}/memory/user` | owner | read/edit user-maintained USER.md with the same session snapshot policy; distinct from the derived profile |
+| `GET` | `/agents/{aid}/memory/manual-review` | owner | read persisted reconciliation status against current documents; no model call or memory mutation |
+| `POST` | `/agents/{aid}/memory/manual-review` | owner | reconcile saved USER.md + MEMORY.md against up to 100 unchecked atoms; duplicates remain stored, proven conflicts retire the old atom and create a replacement review candidate with evidence |
 | `GET`    | `/agents/{aid}/memory/daily/{filename}` | owner | read one daily memory |
 | `DELETE` | `/agents/{aid}/memory/daily/{filename}` | owner | delete one daily memory |
-| `GET`/`PUT` | `/agents/{aid}/memory/extract-config` | owner/admin | Read or patch extraction triggers, `extract_light_timeout_s`, `extract_heavy_timeout_s`, and `extract_max_tokens`. Zero resets budgets/timeouts to runtime defaults. `extract_extra_body` supports only `{"chat_template_kwargs":{"enable_thinking":false}}` (or `true`); `{}` resets it. Unsupported extras return 400 rather than silently having no effect. |
 | `GET`/`POST` | `/memory/...` | user | memory API (dashboard memory tab) |
+
+### Manual document reconciliation
+
+The manual editors save files first, then request reconciliation. The response reports
+`complete`, `partial` (continue checking), `uncertain`, `unavailable`, `failed`, `stale`,
+`disabled`, `too_large`, or `not_checked`, plus conflict/duplicate counts and candidate IDs.
+Semantic checks use the configured memory auxiliary model and require literal document
+evidence; unavailable or uncertain checks never silently retire facts. Combined document
+input above 100,000 characters is explicitly refused. Current documents are checked again
+when accepting a document-derived candidate; stale candidates require review of the new
+version. The file save remains successful if the subsequent semantic check fails.
+
+### Current-expert memory storage maintenance
+
+SQLite restore requires a harness runtime with `MemoryMiddleware.pause_background`
+([octop-harness #69](https://github.com/TencentCloud/octop-harness/pull/69)). Older runtimes
+reject restore before stopping the expert or changing its database. Independent retry
+controls also require this runtime; the extraction config API reports supported options.
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| `GET` | `/agents/{aid}/memory/storage/check` | owner/admin | Read-only inspection; backend, scope, per-expert statistics and cleanup preview |
+| `GET` | `/agents/{aid}/memory/storage/maintenance` | owner/admin | Current progress and this expert's last result, retained until host restart |
+| `POST` | `/agents/{aid}/memory/storage/maintenance` | owner/admin | Body `{confirmed: true}` → `202`; run one host-owned maintenance job |
+| `GET` | `/agents/{aid}/memory/storage/backups` | owner/admin | List this expert’s maintenance and pre-restore SQLite backups from disk |
+| `DELETE` | `/agents/{aid}/memory/storage/backups` | owner/admin | Body `{confirmed: true, backup_id: "server-generated filename"}` → `204`; permanently delete only the selected backup; rejected while maintenance/restore is active |
+| `POST` | `/agents/{aid}/memory/storage/restore` | owner/admin | Body `{confirmed: true, backup_id: "server-generated filename"}` → `202`; back up current state, restore and reload only this expert |
+
+The job waits for the selected expert to become idle and reserves only that
+expert's turn admission. Ownership and storage isolation are checked again after
+waiting. Other experts' conversations can continue. Shared SQLite files and
+colliding PostgreSQL namespaces reject maintenance.
+
+SQLite creates a full file backup before checkpoint deduplication and compaction.
+SQLite restore accepts only regular sibling backup files matching the host’s naming scheme; arbitrary paths and symlinks are rejected. It validates SQLite integrity, namespace ownership and checkpoint references, drains this expert’s background workers, closes its runtime, and creates and fsyncs a full current-state backup before overwriting. SQLite’s backup API manages the database and WAL; files are not blindly replaced. A failed post-restore validation rolls back from the safety snapshot. The expert is recreated before waiting conversations are released. Backups remain discoverable after restart. The control-plane conversation lists/message archives, attachments and configuration are not restored.
+Its inspection uses a separate read-only connection and a consistent snapshot.
+`memory_counts` reports only the selected namespace's logical categories, excluding
+full-text index duplicates. `checkpoint_counts` reports checkpoints, writes, shared
+content blocks and distinct session IDs in a dedicated expert file. Shared files
+omit checkpoint counts because those tables have no expert namespace, and disable
+file maintenance, including when residual foreign namespaces are detected.
+Each count has `rows`, `status` (`ok`, `missing`, `timed_out`) and `elapsed_ms`;
+unavailable counts are null, never zero. Count queries share a five-second budget.
+`elapsed_ms` and `file_check_ms` measure server-side inspection only, excluding
+network transfer; they are not a performance benchmark. Completed SQLite jobs
+include `inspection_before` and `inspection_after` snapshots in `report`, alongside
+file/WAL totals, deduplication statistics and backup size. Counts may remain stable
+because maintenance preserves history; concurrent background writes may affect them.
+
+PostgreSQL limits every read/delete to the live expert's verified namespace and
+backs up exact target rows to a private JSONL file under
+`OCTOP_HOME/backups/memory-maintenance/` before committing a single transaction:
+
+- Rejected candidates decided more than 30 days ago, with no atom referencing them.
+- Operational journal entries older than 14 days (`extract_run`, `gc_*`,
+  `page_regen`, `page_regen_failed`; only the fixed action allowlist is eligible).
+- At most 500 rows per category per pass; locked rows are skipped and another pass
+  can process remaining eligible records.
+
+Active memories, raw evidence, decision journals (including consolidation), and
+all checkpoints remain intact. PostgreSQL results report deleted rows and backup
+size, **not physical disk reclamation**. No shared-table `VACUUM` or host-wide
+orphan sweep runs from this page. Row-byte statistics are estimates that exclude
+indexes, shared overhead and checkpoints. The JSONL header identifies the format,
+namespace and row count; subsequent records contain table names and original rows
+excluding generated search columns. PostgreSQL JSONL restore is not supported by this endpoint.
+
+To verify the PostgreSQL isolation/backup/rollback gate against a dedicated test
+database, set `OCTOP_MEMORY_MAINTENANCE_TEST_DSN` and run
+`uv run pytest tests/integration/test_postgres_memory_storage.py -q`. Never point
+this gate at production: it creates test namespaces and a temporary failure trigger.
 
 ## ACP (Agent Client Protocol)
 
@@ -513,6 +546,53 @@ discovery.
 |--------|------|------|-------|
 | `POST`/`GET`/… | `/internal/mcp/*` | public (mTLS / network-isolated) | MCP gateway used by octop-harness agents (not the dashboard) |
 
+## Octop Agent MCP Gateway
+
+External agents call installed Octop experts through the authenticated
+Streamable HTTP endpoint:
+
+`POST/GET/DELETE /mcp/agents`
+
+Use the same JWT bearer token as the REST API. Use HTTPS when the endpoint is
+available outside the local host. The default token lifetime is 24 hours.
+
+The server exposes three tools:
+
+| Tool | Purpose |
+|------|---------|
+| `list_octop_experts` | List experts visible to the authenticated user |
+| `call_octop_expert` | Start a new isolated expert conversation, or continue one with `thread_id` |
+| `resume_octop_expert` | Resume a call that stopped for tool approval or user input |
+
+`call_octop_expert` returns `thread_id`. Store this value in the external
+agent's working state. Pass it only when the next task must use the same Octop
+conversation. Omit it for a new task. MCP threads cannot attach to dashboard,
+CLI, or IM threads.
+
+When a tool needs approval, the call returns `status: "approval_required"` and
+an `approval` object. Read `approval.request.action_requests` and
+`approval.request.review_configs`. Send one allowed decision for each action to
+`resume_octop_expert`. A resumed call can return another approval request.
+
+Example client configuration:
+
+```json
+{
+  "mcpServers": {
+    "octop-agents": {
+      "type": "streamable_http",
+      "url": "http://127.0.0.1:8090/api/mcp/agents",
+      "headers": {
+        "Authorization": "Bearer <octop-access-token>"
+      }
+    }
+  }
+}
+```
+
+The exact transport key differs by MCP client. Some clients use `http`
+instead of `streamable_http`.
+
 ## Observability & security
 
 | Method | Path | Auth | Notes |
@@ -548,19 +628,14 @@ endpoint (public, mounted directly in `api/app.py`).
 | `POST` | `/agents/{aid}/upload` | user | multipart upload → `{workspace}/inbound/` |
 | `POST` | `/agents/{aid}/files/access-urls` | user | refresh inbound media URLs (signed) |
 | `GET`  | `/agents/{aid}/files/{path}` | owner | read an inbound file |
+| `POST` | `/downloads/link` | user | multipart `file` → `{url, filename, expires_in}`: short-lived link for in-app browsers (WeChat, …) that cannot save `blob:` downloads; capped at `max_upload_mb` |
+| `GET`  | `/downloads/link/{token}` | public (token) | serve that file as an attachment until it expires (10 min); the token is the only credential |
 
 ## Updates, ollama, i18n, plugins, slash, preferences
 
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
-| `GET` | `/update/status` | user | Version status; enterprise distribution reports manual updates |
-| `POST` | `/update/check` | `update` | Returns manual-update status; upstream online checks are disabled |
-| `PATCH` | `/update/settings` | `update` | Retained stable-channel preference; does not enable the disabled upstream updater |
-| `POST` | `/update/upgrade` | `update` | Disabled in this distribution; returns a forbidden error |
-| `GET` | `/update/progress` | `update` | Legacy upgrade-task status by `task_id`; not an enterprise software delivery channel |
-| `POST` | `/update/restart` | `update` | Restart a supported installed service / local server process; does not install software or replace the employee client |
-| `GET` | `/client-config/status` | user | Current user's effective permissions, configuration revision and notification; `Cache-Control: no-store` |
-| `POST` | `/client-config/publish` | admin | Publish a configuration notice; does not change settings or install software |
+| `GET`/`POST` | `/update/status`, `/check`, `/upgrade`, `/progress`, `/restart` | admin | in-place server update flow |
 | `GET`/`POST`/`DELETE` | `/ollama-models/...` | `ollama_models` | Ollama model discovery + downloads |
 | `GET`/`PUT` | `/ollama-models/service` | `ollama_models` | Local daemon toggle; omit `enabled` to set `models_dir` only |
 | `GET` | `/i18n/tools` | user | server-owned tool display names (locale-aware) |
@@ -635,31 +710,3 @@ dashboard mirrors every code under `apiErrors.*` in
 | `STORAGE_BACKEND_UNREACHABLE` | 502 | Remote backend connect / list failed |
 | `CONNECTOR_OAUTH_FAILED` | 400 | OAuth flow could not complete |
 | `INTERNAL_ERROR` | 500 | Unhandled exception (logged with traceback) |
-
-### Company directory and messaging (dashboard)
-
-The dashboard routes `/messages`, `/messages/:conversationId`, `/contacts`, `/contacts/:personId` and
-`/admin/users?tab=departments` use `/api/im` with the normal Octop JWT. Messaging,
-directory browsing and organization administration require `messaging`, `contacts`
-and `departments` respectively. AI conversations continue to use their existing
-agent routes. No active-agent identifier is sent for communication requests.
-
-The single Conversation sidebar entry opens an Agent/company-directory tab switch.
-The directory shows enabled departments as a hierarchy with descendant population
-counts, includes empty departments and groups unassigned people. Selecting a person
-shows their public profile; starting a conversation opens the shared chat area.
-Recent colleague conversations are available within the company tab. Contacts with
-messaging permission can chat across departments; private history and images still
-require participation, and department-group epochs remain scoped to membership.
-Administrators set the company label via `PUT /api/im/organization/directory-settings`.
-
-Organization administrators can read `GET /api/im/organization/users` to assign
-mirrored accounts and `GET /api/im/organization/groups/{id}` to manage department
-group settings and roles. These endpoints do not grant access to messages or
-images; the normal group member endpoints still enforce membership. Ordinary
-contacts are read only from `/api/im/contacts` and `/api/im/departments`.
-
-See `services/communication/api/contract.md` for envelopes, decimal-string
-sequences, snapshot chunks, one-use realtime tickets and private image uploads.
-The frontend keeps communication state and image object URLs in memory for the
-current login session and clears them on logout or permission rejection.

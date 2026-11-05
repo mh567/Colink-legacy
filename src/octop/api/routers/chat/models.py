@@ -6,8 +6,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from octop.infra.devices.protocol import DeviceSelection
-
 # Decision types understood by langchain's HumanInTheLoopMiddleware.
 _DECISION_TYPES: frozenset[str] = frozenset({"approve", "edit", "reject", "respond"})
 # One decision per interrupted tool call; the model cannot fan out further.
@@ -24,8 +22,6 @@ class HitlSessionPolicyBody(BaseModel):
 
 class ChatTurnBody(BaseModel):
     """User turn payload — same fields for WebSocket ``user_turn`` and legacy HTTP bodies."""
-
-    device: DeviceSelection | None = None
 
     messages: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -96,7 +92,6 @@ class ChatTurnBody(BaseModel):
             messages = [{"role": "user", "content": text}] if text else []
         model = payload.get("model") or payload.get("default_model")
         return cls(
-            device=payload.get("device"),
             messages=messages,
             thread_id=str(payload["thread_id"]) if payload.get("thread_id") else None,
             session_key=str(payload["session_key"]) if payload.get("session_key") else None,
@@ -149,7 +144,6 @@ class UserTurnWsFrame(BaseModel):
     """Inbound WebSocket frame from the dashboard."""
 
     type: Literal["user_turn", "ping"] = "user_turn"
-    device: DeviceSelection | None = None
     text: str | None = None
     session_key: str | None = None
     thread_id: str | None = None
@@ -175,13 +169,6 @@ class UserTurnWsFrame(BaseModel):
 class PolishBody(BaseModel):
     text: str
     default_model: str | None = None
-
-
-class CancelThreadResponse(BaseModel):
-    thread_id: str = Field(description="Thread targeted by the cancellation request.")
-    requested: bool = Field(
-        description="Cancellation entry called for an active turn; not proof it stopped."
-    )
 
 
 class RebindSessionBody(BaseModel):

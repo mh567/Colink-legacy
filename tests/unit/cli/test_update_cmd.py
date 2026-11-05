@@ -11,12 +11,6 @@ from octop.cli.main import cli
 from octop.infra.setup import self_update
 
 
-@pytest.fixture(autouse=True)
-def _exercise_retained_upstream_installer(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Legacy mechanics stay testable; the distribution policy is tested separately.
-    monkeypatch.setattr(self_update, "UPSTREAM_SELF_UPDATE_ENABLED", True)
-
-
 def test_update_check_only_no_install(monkeypatch: pytest.MonkeyPatch) -> None:
     import octop.cli.commands.update as update_cmd
 

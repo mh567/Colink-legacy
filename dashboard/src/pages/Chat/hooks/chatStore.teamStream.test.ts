@@ -4,7 +4,6 @@ import {
   ingestHarnessChunk,
   removeSession,
   sendTurn,
-  setMessages,
   setSessionTeamRoom,
 } from "./chatStore";
 
@@ -702,72 +701,33 @@ describe("team member live stream", () => {
     expect(host[1]?.status).toBe("streaming");
   });
 
-  it("keeps remote member answers and wrap-up separate when the user message has not loaded", () => {
-    setMessages(SESSION, [
-      {
-        id: "old-user",
-        role: "user",
-        content: "Previous request",
-        timestamp: 1,
-      },
-      {
-        id: "old-answer",
-        role: "assistant",
-        content: "Previous answer.",
-        status: "done",
-        speakerAgentId: "doctor",
-        timestamp: 2,
-      },
-      {
-        id: "old-wrapup",
-        role: "assistant",
-        content: "Previous result.",
-        status: "done",
-        speakerAgentId: "host",
-        teamWrapup: true,
-        timestamp: 2,
-      },
-    ]);
-    ingestHarnessChunk(
-      SESSION,
-      { type: "token", content: "New assignment.", agent_id: "host" },
-      "host",
-    );
-    ingestHarnessChunk(SESSION, { type: "done", agent_id: "host" }, "host");
-    ingestHarnessChunk(
-      SESSION,
-      { type: "token", content: "New answer.", agent_id: "doctor" },
-      "host",
-    );
-    for (const content of ["New result", "."]) {
-      ingestHarnessChunk(
-        SESSION,
-        { type: "token", content, agent_id: "host", team_wrapup: true },
-        "host",
-      );
-    }
-    ingestHarnessChunk(
-      SESSION,
-      { type: "done", agent_id: "host", team_wrapup: true },
-      "host",
-    );
-
-    const { messages } = getSnapshot(SESSION);
-    expect(
-      messages.find((message) => message.id === "old-wrapup"),
-    ).toMatchObject({
-      content: "Previous result.",
-      status: "done",
+  it("restores an in-progress member answer after refresh and keeps streaming", () => {
+    ingestHarnessChunk(SESSION, {
+      type: "token",
+      content: "hello ",
+      agent_id: "doctor",
+      team_snapshot: true,
+      team_live: true,
     });
-    expect(messages.map((message) => message.content)).toEqual([
-      "Previous request",
-      "Previous answer.",
-      "Previous result.",
-      "New assignment.",
-      "New answer.",
-      "New result.",
-    ]);
-    expect(messages.at(-1)).toMatchObject({ teamWrapup: true, status: "done" });
+    let member = getSnapshot(SESSION).messages.filter(
+      (item) => item.speakerAgentId === "doctor",
+    );
+    expect(member).toHaveLength(1);
+    expect(member[0]?.content).toBe("hello ");
+    expect(member[0]?.status).toBe("streaming");
+    expect(getSnapshot(SESSION).liveSpeakers).toContain("doctor");
+
+    ingestHarnessChunk(SESSION, {
+      type: "token",
+      content: "doc",
+      agent_id: "doctor",
+    });
+    member = getSnapshot(SESSION).messages.filter(
+      (item) => item.speakerAgentId === "doctor" && !item.toolData,
+    );
+    expect(member).toHaveLength(1);
+    expect(member[0]?.content).toBe("hello doc");
+    expect(member[0]?.status).toBe("streaming");
   });
 
   it("merges a member snapshot onto the live bubble", () => {

@@ -23,22 +23,7 @@ describe("formatRunUsage", () => {
           total: "total",
         },
       ),
-    ).toBe("1K input / 700 cache hit (70%) / 80 output / 1.1K total");
-  });
-  it.each([
-    [999, "999"],
-    [1_000, "1K"],
-    [12_500, "12.5K"],
-    [999_999, "1M"],
-    [1_250_000, "1.3M"],
-    [1_000_000_000, "1B"],
-  ])("formats %i tokens as %s", (total_tokens, expected) => {
-    expect(
-      formatRunUsage(
-        { total_tokens },
-        { input: "input", output: "output", total: "total", cacheHit: "cache" },
-      ),
-    ).toBe(`${expected} total`);
+    ).toBe("1000 input / 700 cache hit (70%) / 80 output / 1080 total");
   });
 });
 
@@ -50,6 +35,11 @@ describe("resolveTurnModelRef", () => {
   it("omits model when composer is Auto so backend can resolve expert default", () => {
     expect(resolveTurnModelRef(null, null)).toBeNull();
     expect(resolveTurnModelRef("", null)).toBeNull();
+  });
+
+  it("omits a selection that matches the expert default", () => {
+    expect(resolveTurnModelRef("p/expert", "p/expert")).toBeNull();
+    expect(resolveTurnModelRef("p/other", "p/expert")).toBe("p/other");
   });
 });
 

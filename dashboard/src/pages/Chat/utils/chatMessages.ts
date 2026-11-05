@@ -1,6 +1,5 @@
 import type { TokenUsage } from "../../../api/types";
 import { generateId } from "../../../utils/messageParser";
-import { formatTokenCount } from "../../../utils/formatTokenCount";
 import type {
   ChatAttachment,
   ChatMessage,
@@ -56,16 +55,15 @@ export function normalizeComposerContext(
 /**
  * WS ``model`` field for each turn.
  *
- * Only an explicit composer selection is sent. Agent/user/global defaults are
- * resolved by the backend so they are not mistaken for a sticky override.
+ * Only a composer selection that differs from the expert default is sent.
+ * Matching the expert default (or Auto) is omitted so the backend applies the
+ * live expert setting and does not store it as a sticky thread override.
  */
 export function resolveTurnModelRef(
   selectedModel: string | null | undefined,
   agentDefaultModel: string | null | undefined,
 ): string | null {
-  const selected = (selectedModel || "").trim();
-  void agentDefaultModel;
-  return selected || null;
+  return resolveTurnModelOverride(selectedModel, agentDefaultModel);
 }
 
 /** User picked a model different from the expert default (for UI chips / history). */
@@ -129,13 +127,19 @@ export function buildComposerContext(params: {
 
 export function formatRunUsage(
   usage: TokenUsage | null | undefined,
-  labels: { input: string; output: string; total: string; cacheHit: string },
+  labels: {
+    input: string;
+    output: string;
+    total: string;
+    cacheHit: string;
+    decisionSaved?: string;
+  },
 ): string | null {
   if (!usage) return null;
 
   const parts: string[] = [];
   if (typeof usage.input_tokens === "number") {
-    parts.push(`${formatTokenCount(usage.input_tokens)} ${labels.input}`);
+    parts.push(`${usage.input_tokens} ${labels.input}`);
   }
   if (
     typeof usage.cache_read_tokens === "number" &&
@@ -147,17 +151,20 @@ export function formatRunUsage(
             (usage.cache_read_tokens / usage.input_tokens) * 100,
           )}%)`
         : "";
-    parts.push(
-      `${formatTokenCount(usage.cache_read_tokens)} ${
-        labels.cacheHit
-      }${percent}`,
-    );
+    parts.push(`${usage.cache_read_tokens} ${labels.cacheHit}${percent}`);
   }
   if (typeof usage.output_tokens === "number") {
-    parts.push(`${formatTokenCount(usage.output_tokens)} ${labels.output}`);
+    parts.push(`${usage.output_tokens} ${labels.output}`);
   }
   if (typeof usage.total_tokens === "number") {
-    parts.push(`${formatTokenCount(usage.total_tokens)} ${labels.total}`);
+    parts.push(`${usage.total_tokens} ${labels.total}`);
+  }
+  if (
+    labels.decisionSaved &&
+    typeof usage.decision_saved === "number" &&
+    usage.decision_saved > 0
+  ) {
+    parts.push(`${usage.decision_saved} ${labels.decisionSaved}`);
   }
   return parts.length > 0 ? parts.join(" / ") : null;
 }

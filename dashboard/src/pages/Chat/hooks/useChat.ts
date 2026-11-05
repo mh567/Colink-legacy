@@ -1,6 +1,3 @@
-import { placeLocalArtifactTurns } from "../utils/localArtifactTurns";
-import { isCompanyDesktop } from "@/api/desktopRuntime";
-import type { DeviceSelection } from "@/api/modules/devices";
 import {
   useState,
   useCallback,
@@ -8,8 +5,6 @@ import {
   useSyncExternalStore,
   useEffect,
 } from "react";
-import { useTranslation } from "react-i18next";
-import { message } from "@/utils/antdMessage";
 import type {
   MessageMetadata,
   TokenUsage,
@@ -35,13 +30,23 @@ import {
   parseToolExecutionFeedback,
 } from "../../../utils/toolMediaBlocks";
 import { injectPendingHitlMessage } from "../../../utils/injectPendingHitlMessage";
-import { mergeHistoryWithLocalTail } from "../utils/mergeHistoryTail";
+import {
+  mergeHistoryWithLocalTail,
+  preferLocalTranscript,
+  serverCaughtUp,
+  retainedHistoryPrefix,
+} from "../utils/mergeHistoryTail";
+import {
+  clearInflightTail,
+  readInflightTail,
+} from "../utils/inflightTranscriptCache";
 import { promoteAskUserToolMessage } from "../utils/pendingHitl";
 import { rewritePeerSpeakerId } from "../../../utils/remoteExpert";
-import type {
-  ChatAttachment,
-  ChatMessage,
-  UserComposerContext,
+import {
+  parseDecisionNotice,
+  type ChatAttachment,
+  type ChatMessage,
+  type UserComposerContext,
 } from "./sseHelpers";
 
 export type {
@@ -51,6 +56,7 @@ export type {
   ChatAttachment,
   UserComposerContext,
   ChatMessage,
+  DecisionNotice,
 } from "./sseHelpers";
 
 export type { ContentBlockItem } from "../../../utils/messageParser";
@@ -344,31 +350,12 @@ function attachmentsFromInboundMeta(
           : "file",
       );
       if (!workspacePath) return null;
-      const desktop = row.execution_location === "desktop";
-      if (
-        desktop &&
-        (typeof row.sha256 !== "string" ||
-          !/^[a-f0-9]{64}$/i.test(row.sha256) ||
-          typeof row.size !== "number" ||
-          !Number.isSafeInteger(row.size) ||
-          row.size < 0)
-      )
-        return null;
       return {
         url: "",
         filename,
         mediaType: mediaType || undefined,
         workspacePath,
         kind,
-        ...(desktop
-          ? {
-              localFile: {
-                path: workspacePath,
-                size: row.size as number,
-                sha256: row.sha256 as string,
-              },
-            }
-          : {}),
       } satisfies ChatAttachment;
     })
     .filter(Boolean) as ChatAttachment[];
@@ -385,7 +372,6 @@ function enrichAttachmentPreviewUrls(
   return messages.map((message) => {
     if (!message.attachments?.length) return message;
     const attachments = message.attachments.map((attachment) => {
-      if (attachment.localFile) return { ...attachment, url: "" };
       const url = isRenderableAttachmentUrl(attachment.url)
         ? attachment.url
         : "";
@@ -471,6 +457,12 @@ function convertCallEntries(entries: CallEntry[]): ChatMessage[] {
           : undefined,
       toolData: tool?.data,
       usage: normalizeTokenUsage(entry.usage ?? undefined) ?? undefined,
+      durationMs:
+        typeof entry.duration_ms === "number" &&
+        Number.isFinite(entry.duration_ms) &&
+        entry.duration_ms >= 0
+          ? Math.round(entry.duration_ms)
+          : undefined,
       metadata: normalizeMessageMetadata(entry.metadata ?? undefined),
       errorInfo:
         tool?.kind === "result" && (toolFeedback?.isError || toolErrorCode)
@@ -503,6 +495,7 @@ function convertCallEntries(entries: CallEntry[]): ChatMessage[] {
           ? entry.speaker_agent_id.trim()
           : undefined,
       teamWrapup: Boolean(entry.team_wrapup),
+      decision: parseDecisionNotice(entry.decision) ?? undefined,
       editedFiles: Array.isArray(entry.edited_files)
         ? entry.edited_files
             .filter(
@@ -589,6 +582,7 @@ function convertCallEntries(entries: CallEntry[]): ChatMessage[] {
     reasoning_tokens: 0,
     total_tokens: 0,
     model_calls: 0,
+    decision_saved: 0,
   });
   let turnAcc: TokenUsage | null = null;
   let turnLastInputTokens = 0;
@@ -657,6 +651,8 @@ function convertCallEntries(entries: CallEntry[]): ChatMessage[] {
       turnAcc.total_tokens =
         (turnAcc.total_tokens || 0) + (u.total_tokens || 0);
       turnAcc.model_calls = (turnAcc.model_calls || 0) + (u.model_calls || 1);
+      const saved = typeof u.decision_saved === "number" ? u.decision_saved : 0;
+      turnAcc.decision_saved = (turnAcc.decision_saved || 0) + saved;
       // Strip the per-call usage so only the Turn's final bubble shows a total.
       merged[i] = { ...m, usage: undefined };
     }
@@ -682,6 +678,7 @@ function toHistoryContentBlocks(content: unknown): unknown[] {
 function isDisplayableHistoryMessage(message: ChatMessage): boolean {
   if (message.hitlData) return true;
   if (message.toolData) return true;
+  if (message.decision) return true;
   if (message.attachments && message.attachments.length > 0) return true;
   if (message.contentBlocks?.some((block) => block.content.trim())) return true;
   return message.content.trim().length > 0;
@@ -693,6 +690,7 @@ export function convertHistoryMessages(
     content: unknown;
     id?: string;
     usage?: unknown;
+    duration_ms?: number;
     timestamp?: number;
     composer_context?: unknown;
     inbound_attachments?: unknown;
@@ -701,6 +699,7 @@ export function convertHistoryMessages(
     agent_id?: string;
     team_wrapup?: boolean;
     edited_files?: string[];
+    decision?: unknown;
   }>,
   agentId?: string,
 ): ChatMessage[] {
@@ -718,6 +717,10 @@ export function convertHistoryMessages(
       role: message.role,
       content: toHistoryContentBlocks(message.content),
       usage: normalizeTokenUsage(message.usage ?? undefined),
+      duration_ms:
+        typeof message.duration_ms === "number"
+          ? message.duration_ms
+          : undefined,
       timestamp:
         typeof message.timestamp === "number" ? message.timestamp : undefined,
       metadata: Object.keys(meta).length > 0 ? meta : undefined,
@@ -728,6 +731,7 @@ export function convertHistoryMessages(
           ? message.agent_id.trim()
           : undefined,
       team_wrapup: message.team_wrapup === true,
+      decision: message.decision,
       edited_files: Array.isArray(message.edited_files)
         ? message.edited_files.filter(
             (p): p is string => typeof p === "string" && p.trim().length > 0,
@@ -779,6 +783,8 @@ async function loadThreadHistory(
     offset,
     cursor: params.cursor,
   });
+  if (history.thread_id !== threadId)
+    throw new Error("History response belongs to another thread");
   const artifacts = normalizeThreadArtifacts(
     history.artifacts,
     agentId,
@@ -794,7 +800,7 @@ async function loadThreadHistory(
     syncSessionHitlPolicy(threadId, history.hitl_policy);
     chatStore.setPendingPlanPath(threadId, history.pending_plan_path);
   }
-  let messages = injectPendingHitlMessage(
+  const messages = injectPendingHitlMessage(
     convertHistoryMessages(
       history.messages.filter(
         (message) =>
@@ -806,23 +812,6 @@ async function loadThreadHistory(
     ),
     history.hitl_pending,
   );
-  if (Array.isArray(history.local_artifact_turns)) {
-    chatStore.rememberLocalArtifactHistory(
-      threadId,
-      history.local_artifact_turns.flatMap((turn) => turn.files),
-    );
-    messages = placeLocalArtifactTurns(messages, history.local_artifact_turns);
-  } else if (history.local_artifacts?.length) {
-    messages.push({
-      id: `${threadId}:local-artifacts`,
-      role: "assistant",
-      content: "本次任务生成的本地文件",
-      localArtifacts: history.local_artifacts,
-      localArtifactDeviceId: history.local_device_id ?? undefined,
-      timestamp: messages.at(-1)?.timestamp ?? Date.now(),
-      status: "done",
-    });
-  }
   return {
     messages,
     hasMore: Boolean(history.has_more),
@@ -836,6 +825,40 @@ async function loadThreadHistory(
         ? history.history_retry_after_ms
         : 1500,
   };
+}
+
+function messagesWithInflightCache(
+  sessionId: string,
+  messages: ChatMessage[],
+  loaded: ChatMessage[],
+  turnActive = false,
+): ChatMessage[] {
+  const cached = readInflightTail(sessionId);
+  // A reloaded cache's streaming flag cannot establish that a turn is active.
+  const tail = turnActive
+    ? cached
+    : cached?.map((message) =>
+        message.status === "streaming"
+          ? { ...message, status: "done" as const }
+          : message,
+      );
+  return preferLocalTranscript(messages.length ? messages : loaded, tail);
+}
+
+function dropInflightCacheIfCaughtUp(
+  sessionId: string,
+  loaded: ChatMessage[],
+): void {
+  const cached = readInflightTail(sessionId);
+  if (!cached || cached.length === 0) return;
+  const snap = chatStore.getSnapshot(sessionId);
+  if (
+    snap.isStreaming ||
+    snap.messages.some((message) => message.status === "streaming")
+  ) {
+    return;
+  }
+  if (serverCaughtUp(loaded, cached)) clearInflightTail(sessionId);
 }
 
 // ── The hook ──────────────────────────────────────────────────────────────
@@ -854,8 +877,6 @@ export function useChat(
   useEffect(() => {
     chatStore.setSessionTeamRoom(stableSessionId, isTeamRoom);
   }, [stableSessionId, isTeamRoom]);
-  const { t } = useTranslation();
-  const cancelInFlight = useRef(false);
   const [historyError, setHistoryError] = useState(false);
   const failedHistoryOperation = useRef<"initial" | "older" | "latest">(
     "initial",
@@ -888,7 +909,6 @@ export function useChat(
   const {
     messages,
     isStreaming,
-    localPreparing,
     thinkingStartedAt,
     runUsage,
     contextUsage,
@@ -903,8 +923,21 @@ export function useChat(
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyRefreshing, setHistoryRefreshing] = useState(false);
   const loadGenRef = useRef(0);
-  const loadMoreInFlightRef = useRef(false);
-  const refreshInFlightRef = useRef(false);
+  const loadMoreInFlightRef = useRef<number | null>(null);
+  const refreshInFlightRef = useRef<number | null>(null);
+  useEffect(() => {
+    const generation = loadGenRef;
+    ++generation.current;
+    loadMoreInFlightRef.current = null;
+    refreshInFlightRef.current = null;
+    setHistoryLoading(false);
+    setHistoryRefreshing(false);
+    return () => {
+      ++generation.current;
+      loadMoreInFlightRef.current = null;
+      refreshInFlightRef.current = null;
+    };
+  }, [stableSessionId, agentId]);
 
   const attachAfterHistory = useCallback(
     (key: string, targetThreadId: string) => {
@@ -933,7 +966,6 @@ export function useChat(
       reasoningEffort?: string | null,
       conversationMode?: "ask" | "plan" | "craft" | null,
       hitlPolicy?: HitlSessionPolicy | null,
-      device?: DeviceSelection | null,
     ) => {
       const key = storeKey || stableSessionId;
 
@@ -968,32 +1000,15 @@ export function useChat(
         reasoningEffort,
         conversationMode,
         hitlPolicy,
-        device,
+        userMsg.id,
       );
     },
     [stableSessionId],
   );
 
-  const cancelStream = useCallback(async () => {
-    if (cancelInFlight.current) return;
-    cancelInFlight.current = true;
-    try {
-      const response = await chatStore.cancelStream(
-        stableSessionId,
-        agentId || "",
-      );
-      void message.info(
-        t(response.requested ? "chat.stopRequested" : "chat.stopInactive"),
-      );
-      if (!chatStore.hasLiveSocket(stableSessionId)) {
-        attachAfterHistory(stableSessionId, response.thread_id);
-      }
-    } catch {
-      void message.error(t("chat.stopUnconfirmed"));
-    } finally {
-      cancelInFlight.current = false;
-    }
-  }, [stableSessionId, agentId, attachAfterHistory, t]);
+  const cancelStream = useCallback(() => {
+    chatStore.cancelStream(stableSessionId);
+  }, [stableSessionId]);
 
   const loadHistory = useCallback(
     async (targetThreadId: string) => {
@@ -1012,56 +1027,77 @@ export function useChat(
       // and nothing would refetch them before a page reload.
       const liveTurn =
         snap.isStreaming || (isTeamRoom && chatStore.hasLiveSocket(key));
+      const cachedTail = readInflightTail(key);
       if (
         (snap.messages.length > 0 || liveTurn) &&
         !chatStore.isHistoryStale(key)
       ) {
-        // Always listen after hydrate so late team / inbox replies land here,
-        // not only when a turn is already marked active.
+        if (cachedTail && snap.messages.length > 0 && snap.isStreaming) {
+          chatStore.restoreInflightTail(key, cachedTail);
+        }
+        // Always listen after hydrate so late team / inbox replies land here.
+        // An empty live view still fetches history so the cached tail can be
+        // spliced onto the persisted prefix instead of replacing it.
         attachAfterHistory(key, targetThreadId);
-        return;
+        if (snap.messages.length > 0) return;
       }
 
       // Never cancelStream here — load/hydrate must not stop a live server turn.
-      // The Stop control requests cancellation separately over HTTP.
+      // (Weak resume: only the Stop control / cancelStream may send `cancel`.)
 
+      const epoch = chatStore.beginHistoryRead(key);
       const gen = ++loadGenRef.current;
-      const revision = chatStore.getHistoryRevision(key);
       setHistoryLoading(true);
 
       try {
         let loaded = await loadThreadHistory(agentId, targetThreadId, {
           offset: 0,
         });
-        while (loaded.projectionLoading && loadGenRef.current === gen) {
+        while (
+          loaded.projectionLoading &&
+          loadGenRef.current === gen &&
+          chatStore.isHistoryReadCurrent(key, epoch)
+        ) {
           await new Promise((resolve) =>
             window.setTimeout(
               resolve,
               Math.max(500, Math.min(loaded.retryAfterMs, 5000)),
             ),
           );
-          if (loadGenRef.current !== gen) return;
+          if (
+            loadGenRef.current !== gen ||
+            !chatStore.isHistoryReadCurrent(key, epoch)
+          )
+            return;
           loaded = await loadThreadHistory(agentId, targetThreadId, {
             offset: 0,
           });
         }
         if (
           loadGenRef.current !== gen ||
-          chatStore.getHistoryRevision(key) !== revision
+          !chatStore.isHistoryReadCurrent(key, epoch)
         )
           return;
         // Re-read after the await. A send during this fetch appends a local
         // turn the server page does not have yet; replacing the list drops
-        // that bubble while the websocket turn keeps running.
+        // that bubble while the websocket turn keeps running. A browser cache
+        // covers the same gap when this tab discarded the in-memory tail.
         const current = chatStore.getSnapshot(key);
-        const loadedIds = new Set(loaded.messages.map((message) => message.id));
-        const firstOverlap = current.messages.findIndex((message) =>
-          loadedIds.has(message.id),
+        const local = messagesWithInflightCache(
+          key,
+          current.messages,
+          loaded.messages,
+          loaded.turnActive,
         );
-        const keptOlder = firstOverlap > 0;
+        const keptOlder =
+          retainedHistoryPrefix(loaded.messages, current.messages).length > 0;
         chatStore.setHistoryPage(
           key,
-          mergeHistoryWithLocalTail(loaded.messages, current.messages),
+          mergeHistoryWithLocalTail(
+            loaded.messages,
+            local,
+            current.isStreaming,
+          ),
           {
             hasMore: keptOlder ? current.historyHasMore : loaded.hasMore,
             nextOffset: keptOlder
@@ -1072,10 +1108,14 @@ export function useChat(
               : loaded.nextCursor,
           },
         );
+        dropInflightCacheIfCaughtUp(key, loaded.messages);
         setHistoryError(false);
         attachAfterHistory(key, targetThreadId);
       } catch {
-        if (loadGenRef.current === gen) {
+        if (
+          loadGenRef.current === gen &&
+          chatStore.isHistoryReadCurrent(key, epoch)
+        ) {
           failedHistoryOperation.current = "initial";
           setHistoryError(true);
         }
@@ -1092,7 +1132,7 @@ export function useChat(
     const key = stableSessionId;
     const snap = chatStore.getSnapshot(key);
     if (
-      loadMoreInFlightRef.current ||
+      loadMoreInFlightRef.current !== null ||
       snap.historyLoadingMore ||
       !snap.historyHasMore ||
       !agentId ||
@@ -1101,11 +1141,11 @@ export function useChat(
       return false;
     }
 
-    loadMoreInFlightRef.current = true;
     chatStore.setHistoryLoadingMore(key, true);
     const offset = snap.historyNextOffset;
     const gen = loadGenRef.current;
-    const revision = chatStore.getHistoryRevision(key);
+    const epoch = chatStore.beginHistoryRead(key);
+    loadMoreInFlightRef.current = gen;
 
     try {
       const {
@@ -1117,7 +1157,11 @@ export function useChat(
         offset,
         cursor: snap.historyNextCursor,
       });
-      if (chatStore.getHistoryRevision(key) !== revision) return false;
+      if (
+        loadGenRef.current !== gen ||
+        !chatStore.isHistoryReadCurrent(key, epoch)
+      )
+        return false;
       chatStore.prependHistoryMessages(key, older, {
         hasMore,
         nextOffset,
@@ -1126,14 +1170,20 @@ export function useChat(
       if (loadGenRef.current === gen) setHistoryError(false);
       return true;
     } catch {
-      if (loadGenRef.current === gen) {
+      if (
+        loadGenRef.current === gen &&
+        chatStore.isHistoryReadCurrent(key, epoch)
+      ) {
         failedHistoryOperation.current = "older";
         setHistoryError(true);
       }
       return false;
     } finally {
-      loadMoreInFlightRef.current = false;
-      chatStore.setHistoryLoadingMore(key, false);
+      if (loadMoreInFlightRef.current === gen) {
+        loadMoreInFlightRef.current = null;
+        if (chatStore.isHistoryReadCurrent(key, epoch))
+          chatStore.setHistoryLoadingMore(key, false);
+      }
     }
   }, [agentId, stableSessionId]);
 
@@ -1148,12 +1198,16 @@ export function useChat(
       const key = targetSessionId || stableSessionId;
       const snap = chatStore.getSnapshot(key);
       if (
-        refreshInFlightRef.current ||
+        refreshInFlightRef.current !== null ||
         historyRefreshing ||
         historyLoading ||
         shouldBlockHistoryRefresh({
           isStreaming: snap.isStreaming,
           hasLiveSocket: chatStore.hasLiveSocket(key),
+          liveSpeakerCount: snap.liveSpeakers.length,
+          hasStreamingMessage: snap.messages.some(
+            (message) => message.status === "streaming",
+          ),
         }) ||
         !agentId ||
         key === "__empty__"
@@ -1161,11 +1215,11 @@ export function useChat(
         return;
       }
 
-      refreshInFlightRef.current = true;
       // Separate from loadGenRef: loadHistory may bump loadGen while we fetch.
       // Always clear the refreshing flag in finally so the footer cannot stick.
       const gen = ++loadGenRef.current;
-      const revision = chatStore.getHistoryRevision(key);
+      const epoch = chatStore.beginHistoryRead(key);
+      refreshInFlightRef.current = gen;
       setHistoryRefreshing(true);
 
       try {
@@ -1174,11 +1228,12 @@ export function useChat(
           hasMore,
           nextOffset,
           nextCursor,
+          turnActive,
         } = await loadThreadHistory(agentId, key, { offset: 0 });
         // Stale after a concurrent loadHistory / newer refresh — drop apply only.
         if (
           loadGenRef.current !== gen ||
-          chatStore.getHistoryRevision(key) !== revision
+          !chatStore.isHistoryReadCurrent(key, epoch)
         )
           return;
 
@@ -1186,29 +1241,38 @@ export function useChat(
         // in flight. `snap` is from before the await and must not be the
         // message source — a send during the fetch lives only on the store.
         const current = chatStore.getSnapshot(key);
-        const latestIds = new Set(latest.map((m) => m.id));
-        const firstOverlap = current.messages.findIndex((m) =>
-          latestIds.has(m.id),
+        const local = messagesWithInflightCache(
+          key,
+          current.messages,
+          latest,
+          turnActive,
         );
-        const keptOlder = firstOverlap > 0;
+        const keptOlder =
+          retainedHistoryPrefix(latest, current.messages).length > 0;
         chatStore.setHistoryPage(
           key,
-          mergeHistoryWithLocalTail(latest, current.messages),
+          mergeHistoryWithLocalTail(latest, local, current.isStreaming),
           {
             hasMore: keptOlder ? current.historyHasMore : hasMore,
             nextOffset: keptOlder ? current.historyNextOffset : nextOffset,
             nextCursor: keptOlder ? current.historyNextCursor : nextCursor,
           },
         );
+        dropInflightCacheIfCaughtUp(key, latest);
         setHistoryError(false);
       } catch {
-        if (loadGenRef.current === gen) {
+        if (
+          loadGenRef.current === gen &&
+          chatStore.isHistoryReadCurrent(key, epoch)
+        ) {
           failedHistoryOperation.current = "latest";
           setHistoryError(true);
         }
       } finally {
-        refreshInFlightRef.current = false;
-        setHistoryRefreshing(false);
+        if (refreshInFlightRef.current === gen) {
+          refreshInFlightRef.current = null;
+          setHistoryRefreshing(false);
+        }
       }
     },
     [agentId, stableSessionId, historyRefreshing, historyLoading],
@@ -1227,33 +1291,18 @@ export function useChat(
    * Mirrors the behaviour of Claude / ChatGPT "edit message".
    */
   const editAndResend = useCallback(
-    async (
+    (
       messageId: string,
       newText: string,
       _sessionKey: string,
       agentId: string,
     ) => {
-      if (isCompanyDesktop()) {
-        try {
-          await chatStore.editLocalMessage(
-            stableSessionId,
-            messageId,
-            newText,
-            agentId,
-          );
-        } catch (error) {
-          void message.error(
-            error instanceof Error ? error.message : t("chat.sendFailed"),
-          );
-        }
-        return;
-      }
-      const ok = chatStore.truncateAndReplaceUserMessage(
+      const clientId = chatStore.truncateAndReplaceUserMessage(
         stableSessionId,
         messageId,
         newText,
       );
-      if (!ok) return;
+      if (!clientId) return;
 
       // Re-send without appending a new user message — it is already in the store
       chatStore.sendTurn(
@@ -1265,9 +1314,17 @@ export function useChat(
         undefined,
         undefined,
         stableSessionId !== "__empty__" ? stableSessionId : undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        clientId,
       );
     },
-    [stableSessionId, t],
+    [stableSessionId],
   );
 
   const clearMessages = useCallback(() => {
@@ -1306,7 +1363,6 @@ export function useChat(
   return {
     messages,
     isStreaming,
-    localPreparing,
     thinkingStartedAt,
     runUsage,
     contextUsage,

@@ -1,13 +1,5 @@
 # AGENTS.md
 
-## Octop Enterprise 发行约定
-
-本仓库采用以下发行约定：对外名称 Octop Enterprise，独立仓库 https://github.com/colorAi/Octop-Enterprise；主项目和自有通信服务使用 MIT。当前版本不因资料整理自动升级。仅在维护者明确要求时修改版本或提交 Git，不主动推送。只运行受影响模块及关联检查。独立更新渠道尚未建立，在线自更新与上游安装脚本已停用，不得通过上游 PyPI 包覆盖本分支。公开源码必须使用 tools/export_public_source.py 导出，排除本地记录、Git 历史和限制再分发的材料；上游自动发布工作流在公开副本中归档为 inactive。发布事项以 docs/open-source-release.md 为准。
-
-名称按使用场景选择：仓库名称、README 标题和主要产品介绍、正式安装包与软件包元数据使用全称 Octop Enterprise；传播文案、海报、紧凑界面标签及日常交流可使用短称 Octop Ent。不做全库缩写清除；安装路径、协议标识、历史版权与来源记录按兼容性和溯源要求保留。
-
-README 与公开使用文档面向使用者，描述当前产品、操作步骤和必要限制；不写命名变更解释、当次整理过程、私库状态、个人工作记录或未确定的发布计划，也不为使用短称添加冗余解释。构建前提放在构建文档，维护者发行流程放在发行文档；保留准确的来源、许可和兼容性说明。
-
 Navigation guide for AI coding agents working in this repository.
 
 ## 1. Collaboration principles
@@ -20,6 +12,7 @@ Navigation guide for AI coding agents working in this repository.
 - When multiple interpretations exist, list them and let the user choose — do not pick silently.
 - Suggest simpler approaches when they exist; push back when appropriate.
 - Stop when blocked; name exactly what is unclear.
+- Name the owning repository before editing (see [Runtime libraries](#runtime-libraries)).
 
 ### Simplicity first
 
@@ -44,7 +37,21 @@ Navigation guide for AI coding agents working in this repository.
 
 **Octop** — self-hosted AI assistant platform (multi-user, multi-agent).
 One Python wheel: FastAPI backend + React dashboard + Click CLI.
-Base mode needs no external queue or services beyond an LLM provider. Enterprise mode also uses PostgreSQL, the Go communication service, and Docker isolation; see `docker/enterprise/README.md`.
+No external queue. No required services beyond an LLM provider.
+
+### Runtime libraries
+
+Octop hosts four libraries. Put the change in the library that owns the behavior. This repo only wires users, the control-plane database, HTTP, CLI, dashboard, and cron.
+
+| Change | Repository |
+|--------|------------|
+| Agent loop, tools, skills, backends, middleware; turn wiring for memory and `browser_use` | [octop-harness](https://github.com/TencentCloud/octop-harness) |
+| IM platform protocol, media upload, group activation | [octop-gateway](https://github.com/TencentCloud/octop-gateway) |
+| Memory capture, recall, ranking, schema, storage | [octop-memory](https://github.com/TencentCloud/octop-memory) |
+| Chrome CDP, profiles, DOM, `browser_tool` | [octop-browser](https://github.com/TencentCloud/octop-browser) |
+| Users, auth, threads, cron, experts, dashboard | this repo |
+
+Do not copy that behavior into `src/octop/`. Follow the library's `AGENTS.md`. When the library releases, bump its pin in `pyproject.toml`.
 
 ## 3. Tech stack
 
@@ -54,8 +61,10 @@ Base mode needs no external queue or services beyond an LLM provider. Enterprise
 | Web framework | FastAPI + uvicorn |
 | Async runtime | asyncio (no threads except `run_in_executor`) |
 | Database | SQLite via sync `sqlite3` (WAL) **or** PostgreSQL via `psycopg` / `psycopg_pool` |
-| LLM runtime | `octop-harness` (LangGraph) |
-| Gateway | `octop-gateway` |
+| Agent runtime | `octop-harness` |
+| IM channels | `octop-gateway` |
+| Memory | `octop-memory` |
+| Browser | `octop-browser` |
 | Frontend | React 18 + TypeScript + Vite |
 | Package manager | uv — always `uv run pytest`, never bare `pytest` |
 | API docs UI | Scalar (`scalar-fastapi`) at `/api/docs` |
@@ -81,7 +90,7 @@ tests/                        pytest (`unit/`, `integration/`)
 
 ## 5. Module boundaries
 
-**Rule of thumb:** dependencies flow **inward** — transport layers call domain; domain never calls HTTP/CLI. Within `infra/`, leaf modules (`utils/`, `db/repos/`, `errors.py`) stay free of higher-level orchestration.
+**Rule of thumb:** dependencies flow **inward** — transport layers call domain; domain never calls HTTP/CLI. Within `infra/`, leaf modules (`utils/`, `db/repos/`, `errors.py`) stay free of higher-level orchestration. Library behavior stays in that library (see [Runtime libraries](#runtime-libraries)).
 
 ### Layer overview
 
@@ -118,6 +127,7 @@ cli/ ──► launch.py ──► api/ + infra/
 | `infra/agents/` | Agent registry (`manager.py`), harness runtime, providers, settings (`settings/`), workspace paths (`workspace/`), threads helpers (`threads/`), security, persona/MBTI, experts, plugins, teams, memory | `server.py`, `gateway/`, `api/routers/agents.py` |
 | `infra/backend/` | Workspace storage adapter, resolver, remote probe (COS/S3/…) | `agents/`, `api/routers/workspace*.py` |
 | `infra/connectors/` | Connector catalog, OAuth, MCP gateway, credential crypto | `api/routers/connectors.py`, `internal_mcp.py`, `agents/manager.py` (MCP assembly) |
+| `infra/control/` | Host control surfaces: `browser/`, `desktop/`, `mobile/` | `api/routers/browser/`, `desktop/`, `mobile/` |
 | `infra/cron/` | Cron jobs, triggers, agent tool hooks | `server.py`, `api/routers/cron.py` |
 | `infra/db/` | `SqlitePool`, migrations, `RepoBundle` / `SharedServices` in `services.py` | all domain code needing persistence |
 | `infra/gateway/` | IM ingress (`processor.py`), threads, slash commands (`slash/`), bot setup (`bot_creators/`) | `server.py`, `api/routers/chat.py`, `channels.py` |
@@ -147,7 +157,7 @@ Only `launch.py` may import both `infra/server` and `api/app` in the same module
 | `api/openapi_meta.py` | Scalar tags, API intro text | route handlers |
 | `api/errors.py` | Map `OctopError` → HTTP status + JSON | new error semantics (add to `infra/errors.py`) |
 | `api/routers/` | One resource per module; Pydantic request/response models | persistence, harness calls — delegate to `infra/` |
-| `api/routers/browser/` | Browser session/stream/harness HTTP surface | Playwright logic (stays in harness or helpers here only as glue) |
+| `api/routers/browser/` | Browser session/stream HTTP surface | CDP, profiles, and DOM stay in `octop-browser`; this router is glue |
 
 ### `cli/` layout
 
@@ -168,8 +178,9 @@ Only `launch.py` may import both `infra/server` and `api/app` in the same module
 
 | Layer | When | Examples |
 |-------|------|----------|
-| **Offline** | Read/write local `~/.octop` SQLite only | `user *`, `provider *`, `cron` list/create/delete, `agent list/delete`, `chats` CRUD, `models` presets/list/active, `channel` CRUD, `admin`, `skills` enable/disable |
+| **Offline** | Read/write local `~/.octop` SQLite only | `user *`, `provider *`, `cron` list/create/delete, `agent list/delete`, `chats` CRUD, `models` presets/list/active, `channel` CRUD, `admin`, `skills` enable/disable, `bridge` list/get |
 | **Embedded** | Needs harness/gateway runtime; boots in-process `OctopServer` | `chats send/repl`, `chats get` (history), `cron run-now`, `agent` create/start/stop/reload, `provider test`, `channel test`, `skills list`, `acp` |
+| **Embedded (bridge)** | In-process `BridgeManager` (no full server); CLI cannot keep Bridge WS after exit | `bridge` probe/create/patch/delete/connect/disconnect/agents |
 | **External** | Talks to OS/daemon directly, no Octop HTTP | `models ollama-*`, channel QR bind (WeCom/WeChat), Feishu bot-creator subprocess |
 
 No `octop user login` — CLI trusts local filesystem access to `~/.octop`. Pin acting user with `octop config set-user` or root `--user`; pin agent with `octop agent use` or root `--agent`. If `octop run` is already running, config CLI writes take effect after server restart (cron, channels loaded at boot).
@@ -206,7 +217,7 @@ cd dashboard && npx tsc -b             # frontend typecheck (after UI changes)
 make build-frontend                     # dashboard/ → src/octop/dashboard/
 ```
 
-**Git hooks (required for local commits):** after cloning, run **`make install-hooks`** once. That sets `core.hooksPath=.githooks` so every `git commit` runs **`make precommit`** (which first runs **`format-all`**: backend Ruff + dashboard Prettier write, then lint / typecheck / testmon-scoped tests) and dashboard **`npm run build`**. Formatted files that were already staged are re-added so the commit includes the formatted content. Bypass only in emergencies: `SKIP_PRECOMMIT=1 git commit …` or `git commit --no-verify`. Do **not** skip hooks to land red tests — fix the suite first (CI runs on Linux **and** Windows).
+**Git hooks (required for local commits):** after cloning, run **`make install-hooks`** once. That sets `core.hooksPath=.githooks` so every `git commit` runs **`make all`** (which first runs **`format-all`**: backend Ruff + dashboard Prettier write, then lint / typecheck / test) and dashboard **`npm run build`**. Formatted files that were already staged are re-added so the commit includes the formatted content. Bypass only in emergencies: `SKIP_PRECOMMIT=1 git commit …` or `git commit --no-verify`. Do **not** skip hooks to land red tests — fix the suite first (CI runs on Linux **and** Windows).
 
 ## 7. Key patterns
 
@@ -230,10 +241,10 @@ New agents additionally keep system-scoped files under `{workspace}/.octop/` (e.
 
 **Database:** SQLite and PostgreSQL share one schema. Add or change tables via a numbered pair
 `infra/db/migrations/00N_description.sql` **and** `00N_description.pg.sql`, then bump the
-version assertion in `tests/unit/db/test_db_pool.py` (currently `v == 25`). Rebuilds that SQLite
+version assertion in `tests/unit/db/test_db_pool.py` (currently `v == 22`). Rebuilds that SQLite
 cannot express as `ALTER` live in `infra/db/migrate.py` helpers and must stay idempotent.
 
-Unreleased schema work on `main` **folds into the current unreleased `00N`**, not a new
+Unreleased schema work on `develop` **folds into the current unreleased `00N`**, not a new
 `00N+1`. Only cut a new number after that version has shipped (or after a local DB at `N` would
 otherwise skip the change). `_schema_version` is an applied-migration watermark, not a changelog
 of every edit. The numbered SQL pair is the canonical v(N-1)→vN DDL (including table rebuilds);
@@ -343,6 +354,7 @@ User-facing datetime display and cron/scheduling defaults MUST use the server ti
 
 Boundary rules are in [§5](#5-module-boundaries). Additionally:
 
+- Do not reimplement `octop-harness`, `octop-gateway`, `octop-memory`, or `octop-browser` under `src/octop/` (see [Runtime libraries](#runtime-libraries)).
 - Do not import legacy top-level modules — use current paths:
   - `octop.agents.*` → `octop.infra.agents.*`
   - `octop.channels.*` → `octop.infra.gateway.*`
@@ -376,10 +388,10 @@ Boundary rules are in [§5](#5-module-boundaries). Additionally:
 | Internationalization (dashboard) | `dashboard/src/locales/`, `dashboard/src/i18n.ts`, `dashboard/src/utils/apiError.ts` |
 | Server timezone (config.json) | `default_timezone` in `config.py`; `GET /api/settings/timezone`; `dashboard/src/hooks/useServerTimezone.ts`; `dashboard/src/utils/formatMessageTime.ts` |
 | Test layout & shared helpers | `tests/support/` (`fakes`, `auth`, `http`, `scenarios`, `app`), `tests/integration/conftest.py`, `tests/unit/{db,cron,gateway,agents,api,cli}/` |
-| Pre-commit hooks | `make install-hooks` → `.githooks/pre-commit` (`make precommit` incl. `format-all` + dashboard build) |
+| Pre-commit hooks | `make install-hooks` → `.githooks/pre-commit` (`make all` incl. `format-all` + dashboard build) |
 | What is a Thread? | `infra/gateway/threads.py`, `infra/db/repos/threads.py` |
 | Workspace backend resolution | `infra/backend/resolver.py`, `infra/backend/adapter.py` |
-| Connectors & OAuth | `infra/connectors/`, `api/routers/connectors.py` |
+| Connectors & OAuth | `infra/connectors/catalog.json` (built-in metadata + i18n), `infra/connectors/`, `api/routers/connectors.py`; human list: `docs/connectors.md` |
 | OpenAPI tags and API intro | `api/openapi_meta.py` |
 | Human-readable API reference | `docs/api.md` |
 | SharedServices / RepoBundle | `infra/db/services.py` |
@@ -387,19 +399,35 @@ Boundary rules are in [§5](#5-module-boundaries). Additionally:
 
 ## 10. Change workflow
 
-1. **Clarify scope** — read relevant code/docs; confirm assumptions and ambiguities with the user (see [§1](#1-collaboration-principles)).
-2. **Hooks** — if this clone has not run `make install-hooks` yet, do it before committing (see [§6](#6-run-commands)). Pre-commit must stay green (`make precommit` + dashboard build).
+1. **Clarify scope** — read relevant code/docs; confirm assumptions and ambiguities with the user (see [§1](#1-collaboration-principles)). If the behavior belongs to a runtime library, change that repo (see [Runtime libraries](#runtime-libraries)).
+2. **Hooks** — if this clone has not run `make install-hooks` yet, do it before committing (see [§6](#6-run-commands)). Pre-commit must stay green (`make all` + dashboard build).
 3. **Minimal implementation** — change only task-related files; dashboard source is in `dashboard/`, build output in `src/octop/dashboard/` (run `make build-frontend` after UI changes).
 4. **Verify** — backend/ship bar: `make all` (`format-all` + `lint` + `typecheck` + `test`). After `dashboard/` changes, also run `cd dashboard && npx tsc -b` (and `npm run lint` when appropriate). After API route changes, glance at `/api/docs` for readable summaries and schemas. After i18n JSON changes, run `uv run pytest tests/unit/i18n -q`. Treat Windows CI as part of the bar: follow [§7 Cross-platform tests](#7-key-patterns).
 5. **Wrap up** — remove orphan symbols introduced in this change; do not commit or push unless asked.
 
 ### Branching & release
 
-- 本仓库以 `main` 为默认分支，feature/fix/hotfix 工作分支均向本仓库 `main` 提交 PR。
-- 需要冻结发行时可使用临时 `release/x.y.z` 分支，合入 `main` 后再由维护者安排标签。
-- 不沿用上游分支同步、自动发布或生产标签工作流；公开副本中的上游工作流均为 inactive。
-- 只运行受影响模块及关联检查；版本升级、Git 提交、标签和发布须按维护者明确安排，不主动推送。
-- 贡献与发行细节见 `CONTRIBUTING.md` 和 `docs/open-source-release.md`。
+```
+feature/* ──PR──► develop ──► release/x.y.z ──PR──► main ──tag v*──► publish
+hotfix/* ──PR──► main (+ tag) and ──PR──► develop
+```
+
+| Branch | Role |
+|--------|------|
+| `main` | Production source of truth; **default branch**; only release / hotfix merges; **only `v*` tags on `main` are production** |
+| `develop` | Daily integration; **base for feature PRs** |
+| `release/x.y.z` | Temporary freeze (version bump / CHANGELOG / bugfixes); **delete after ship** |
+
+**Rules**
+
+- Never push `develop` directly onto `main` — ship via `release/*` → `main` (or hotfix → `main`) only. Do **not** bulk-merge `develop` → `main`; it forks history and breaks post-release sync.
+- Merge `release/*` → `main` with a **merge commit** (not squash) so `main` stays reconcilable with `develop`.
+- Release sequence: cut `release/*` from latest `develop` → PR into `main` → **tag `v*` on main tip only after merge** → delete `release/*` → Actions syncs `main` → `develop` (`sync-main-to-develop.yml`; opens `chore/sync-develop-after-*` on conflict / branch protection).
+- Keep **`main` an ancestor of `develop`** after every release. Do not use legacy `head=main` → `develop` sync PRs.
+- Do **not** push a production tag from a release/feature branch before it is on `main`.
+- Hotfix: branch from `main`, PR to `main` (and tag if shipping), then PR into `develop`.
+- Day-to-day feature work: branch from `develop`, open PR **into `develop`** (not `main`).
+- Human detail: `CONTRIBUTING.md`. Agent publish flow: `.cursor/skills/publish`.
 
 ## 11. Communication
 

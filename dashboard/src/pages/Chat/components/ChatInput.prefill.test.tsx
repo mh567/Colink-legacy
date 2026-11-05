@@ -1,15 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { createRef } from "react";
-import type { ChatAttachment } from "../hooks/useChat";
-import { BEFORE_CLIENT_CONFIG_REFRESH_EVENT } from "../../../utils/clientConfigUpdate";
-import { writeInputDraft } from "../hooks/chatStore";
-
-const guardState = vi.hoisted(() => ({
-  attachments: [] as ChatAttachment[],
-  uploading: false,
-  recording: false,
-}));
 
 vi.mock("../../../hooks/useIsMobile", () => ({
   useIsMobile: () => false,
@@ -24,8 +15,11 @@ vi.mock("../../../hooks/useSlashCommands", () => ({
 
 vi.mock("../../../hooks/useVoiceInput", () => ({
   useVoiceInput: () => ({
-    recording: guardState.recording,
+    recording: false,
     transcribing: false,
+    realtime: false,
+    start: vi.fn(),
+    stop: vi.fn(),
     toggle: vi.fn(),
   }),
 }));
@@ -41,11 +35,13 @@ vi.mock("../../../hooks/viewport", () => ({
 
 vi.mock("../hooks/useChatAttachments", () => ({
   useChatAttachments: () => ({
-    attachments: guardState.attachments,
-    uploading: guardState.uploading,
+    attachments: [],
+    uploading: false,
     dragOver: false,
     fileInputRef: { current: null },
+    folderInputRef: { current: null },
     handleFileSelect: vi.fn(),
+    handleFolderSelect: vi.fn(),
     handleFileChange: vi.fn(),
     removeAttachment: vi.fn(),
     clearAttachments: vi.fn(),
@@ -60,10 +56,10 @@ vi.mock("../hooks/useChatAttachments", () => ({
 
 vi.mock("../hooks/chatStore", () => ({
   consumePendingPrefillAttachments: () => [],
+  onSteerRestore: () => vi.fn(),
   readInputDraft: (agentId: string) =>
     agentId === "agent-2" ? "target expert draft" : "",
   writeInputDraft: vi.fn(),
-  onSteerRestore: () => () => {},
 }));
 
 vi.mock("./ChatInputPreviewBar", () => ({
@@ -139,70 +135,9 @@ import ChatInput, { type ChatInputHandle } from "./ChatInput";
 
 beforeEach(() => {
   vi.clearAllMocks();
-  guardState.attachments = [];
-  guardState.uploading = false;
-  guardState.recording = false;
 });
 
 describe("ChatInput prefill clear-on-send", () => {
-  it("flushes the latest draft synchronously before configuration refresh", () => {
-    render(
-      <ChatInput
-        onSend={vi.fn()}
-        onCancel={vi.fn()}
-        onNewChat={vi.fn()}
-        isStreaming={false}
-        agentId="expert"
-        threadId="thread"
-      />,
-    );
-    fireEvent.change(screen.getByRole("textbox"), {
-      target: { value: "last keystroke" },
-    });
-    const event = new Event(BEFORE_CLIENT_CONFIG_REFRESH_EVENT, {
-      cancelable: true,
-    });
-    window.dispatchEvent(event);
-    expect(event.defaultPrevented).toBe(false);
-    expect(writeInputDraft).toHaveBeenLastCalledWith(
-      "expert",
-      "thread",
-      "last keystroke",
-    );
-  });
-
-  it.each(["attachments", "uploading", "recording", "queue"])(
-    "blocks configuration refresh while preserving %s",
-    (mode) => {
-      if (mode === "attachments")
-        guardState.attachments = [
-          { url: "blob:unsent", filename: "photo.png", kind: "image" },
-        ];
-      guardState.uploading = mode === "uploading";
-      guardState.recording = mode === "recording";
-      render(
-        <ChatInput
-          onSend={vi.fn()}
-          onCancel={vi.fn()}
-          onNewChat={vi.fn()}
-          isStreaming={false}
-          agentId="expert"
-          threadId="thread"
-          queuedItems={
-            mode === "queue"
-              ? [{ id: "queued", text: "pending", createdAt: 1 }]
-              : []
-          }
-        />,
-      );
-      const event = new Event(BEFORE_CLIENT_CONFIG_REFRESH_EVENT, {
-        cancelable: true,
-      });
-      window.dispatchEvent(event);
-      expect(event.defaultPrevented).toBe(true);
-    },
-  );
-
   it("does not restore stale initialText after send (skill-card prefill path)", async () => {
     // Mirrors welcome skill/quick-card flow:
     // 1) setPrefillText fills the composer imperatively while parent initialText

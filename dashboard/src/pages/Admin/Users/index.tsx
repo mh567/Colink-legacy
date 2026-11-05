@@ -1,12 +1,12 @@
 import { useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { IdCard, Network, Users } from "lucide-react";
+import { Group, IdCard, Network, Users } from "lucide-react";
 import PageShell from "../../../layouts/PageShell";
 import TabBar, { type TabBarItem } from "../../../components/TabLabel/TabBar";
 import { TAB_ICON_SIZE } from "../../../components/TabLabel";
 import { TabPanelHeader } from "../../Settings/AdvancedSettings/TabPanelHeader";
-import DepartmentsPanel from "./DepartmentsPanel";
 import RolesPanel from "./RolesPanel";
+import GroupsPanel from "./GroupsPanel";
 import UsersListPanel from "./UsersListPanel";
 import SsoPanel from "./SsoPanel";
 import LdapPanel from "./LdapPanel";
@@ -21,13 +21,7 @@ import dingtalkIcon from "../../../assets/channels/dingtalk.svg";
 import openidIcon from "../../../assets/providers/openid.svg";
 import styles from "./index.module.less";
 
-type TabKey =
-  | "departments"
-  | "local"
-  | "roles"
-  | OauthAppKind
-  | "oidc"
-  | "ldap";
+type TabKey = "local" | "roles" | "groups" | OauthAppKind | "oidc" | "ldap";
 
 const OAUTH_BRAND_ICONS: Record<OauthAppKind, string> = {
   feishu: feishuIcon,
@@ -47,12 +41,8 @@ function BrandTabIcon({
 
 const TABS: TabBarItem<TabKey>[] = [
   { key: "local", labelKey: "adminUsers.tabLocal", icon: Users },
-  {
-    key: "departments",
-    labelKey: "communication.companyStructure",
-    icon: Network,
-  },
   { key: "roles", labelKey: "adminUsers.tabRoles", icon: IdCard },
+  { key: "groups", labelKey: "adminUsers.tabGroups", icon: Group },
   {
     key: "feishu",
     labelKey: "adminUsers.tabFeishu",
@@ -81,8 +71,8 @@ const TABS: TabBarItem<TabKey>[] = [
 ];
 
 function parseTab(raw: string | null): TabKey {
-  if (raw === "departments") return "departments";
   if (raw === "roles") return "roles";
+  if (raw === "groups") return "groups";
   if (
     raw === "feishu" ||
     raw === "wecom" ||
@@ -129,10 +119,10 @@ export default function AdminUsersPage() {
   if (forbidden) return <ForbiddenPage />;
 
   let body: ReactNode = <UsersListPanel />;
-  if (activeTab === "departments") {
-    body = <DepartmentsPanel />;
-  } else if (activeTab === "roles") {
+  if (activeTab === "roles") {
     body = <RolesPanel />;
+  } else if (activeTab === "groups") {
+    body = <GroupsPanel />;
   } else if (activeTab === "oidc") {
     body = (
       <div className={styles.ssoPanel}>

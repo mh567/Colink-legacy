@@ -11,26 +11,22 @@
     !define INFO_PROJECTNAME "Octop"
 !endif
 !ifndef INFO_COMPANYNAME
-    !define INFO_COMPANYNAME "Octop Enterprise contributors"
+    !define INFO_COMPANYNAME "Octop"
 !endif
 !ifndef INFO_PRODUCTNAME
-    !define INFO_PRODUCTNAME "Octop Enterprise"
+    !define INFO_PRODUCTNAME "Octop"
 !endif
 !ifndef INFO_PRODUCTVERSION
-    !define INFO_PRODUCTVERSION "1.0.1b1"
+    !define INFO_PRODUCTVERSION "0.9.31"
 !endif
 !ifndef INFO_COPYRIGHT
-    !define INFO_COPYRIGHT "(c) 2026, Octop Enterprise contributors"
+    !define INFO_COPYRIGHT "(c) 2026, Octop"
 !endif
 !ifndef PRODUCT_EXECUTABLE
     !define PRODUCT_EXECUTABLE "${INFO_PROJECTNAME}.exe"
 !endif
-# Keep installation storage and registration stable when the display name changes.
-!ifndef OCTOP_INSTALL_DIR_NAME
-    !define OCTOP_INSTALL_DIR_NAME "Octop Ent"
-!endif
 !ifndef UNINST_KEY_NAME
-    !define UNINST_KEY_NAME "Octop Ent contributorsOctop Ent"
+    !define UNINST_KEY_NAME "${INFO_COMPANYNAME}${INFO_PRODUCTNAME}"
 !endif
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}"
 
@@ -201,27 +197,8 @@ RequestExecutionLevel "${REQUEST_EXECUTION_LEVEL}"
     InitPluginsDir
     CreateDirectory "$pluginsdir\webview2bootstrapper"
     SetOutPath "$pluginsdir\webview2bootstrapper"
-    !ifdef OCTOP_COMPANY_OFFLINE
-        ; Enterprise installers never run the online bootstrapper. IT may either
-        ; preinstall WebView2 or bundle its complete, architecture-matched installer.
-        !ifdef OCTOP_WEBVIEW2_OFFLINE_INSTALLER
-            File "/oname=WebView2Offline.exe" "${OCTOP_WEBVIEW2_OFFLINE_INSTALLER}"
-            ExecWait '"$pluginsdir\webview2bootstrapper\WebView2Offline.exe" /silent /install' $1
-            ${If} $1 != 0
-            ${AndIf} $1 != 3010
-                SetErrorLevel $1
-                MessageBox MB_ICONSTOP "WebView2 offline installation failed. Contact company IT."
-                Abort
-            ${EndIf}
-        !else
-            SetErrorLevel 66
-            MessageBox MB_ICONSTOP "Company IT must install the matching WebView2 Runtime before installing Octop. This installer will not download from the Internet."
-            Abort
-        !endif
-    !else
     File "MicrosoftEdgeWebview2Setup.exe"
     ExecWait '"$pluginsdir\webview2bootstrapper\MicrosoftEdgeWebview2Setup.exe" /silent /install'
-    !endif
 
     SetDetailsPrint both
     ok:

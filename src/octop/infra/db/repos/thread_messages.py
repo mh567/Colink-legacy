@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
 
 from octop.infra.db.pool import DatabasePool
 from octop.infra.db.repos._base import DbRow, now_ts
@@ -68,37 +66,6 @@ class ThreadMessageRepo:
                 "SELECT COALESCE(MAX(seq),0) FROM thread_messages WHERE thread_id=?", (thread_id,)
             ).fetchone()
         return int(row[0])
-
-    def last_context_usage(self, thread_id: str) -> dict[str, Any] | None:
-        """Read recent request metadata without loading checkpoint blobs or large replies."""
-        with self._db.connect() as conn:
-            rows = conn.execute(
-                "SELECT CASE WHEN length(message_json)<=262144 THEN message_json ELSE NULL END "
-                "AS payload FROM thread_messages WHERE thread_id=? AND role IN ('ai','assistant') "
-                "ORDER BY seq DESC LIMIT 10",
-                (thread_id,),
-            ).fetchall()
-        for row in rows:
-            if not row["payload"]:
-                continue
-            try:
-                message = json.loads(row["payload"])
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(message, dict):
-                continue
-            data = message.get("data") or message.get("kwargs") or message
-            if not isinstance(data, dict):
-                continue
-            extra = data.get("additional_kwargs")
-            usage = extra.get("context_usage") if isinstance(extra, dict) else None
-            if isinstance(usage, dict) and isinstance(usage.get("segments"), dict):
-                return {
-                    key: usage[key]
-                    for key in ("max_tokens", "used_tokens", "input_tokens", "segments")
-                    if key in usage
-                }
-        return None
 
     def range_rows(self, thread_id: str, start: int, end: int) -> list[ThreadMessageRow]:
         """Read an immutable legacy interval without triggering projection backfill."""

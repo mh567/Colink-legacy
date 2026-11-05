@@ -18,6 +18,7 @@ from octop_gateway.models import (
     TextContent,
     VideoContent,
 )
+from octop_gateway.utils import close_event_stream
 
 from octop.i18n.domains.stream import format_stream_error
 from octop.infra.gateway.media.attachment_hints import (
@@ -28,7 +29,6 @@ from octop.infra.gateway.process.message_keys import INBOUND_ATTACHMENTS_KEY
 from octop.infra.gateway.steer import DiscardBundle, DrainBundle, SteerCoordinator
 from octop.infra.gateway.threads import ThreadRegistry
 from octop.infra.gateway.ws.ws_hub import WebSocketHub
-from octop.infra.utils.asyncio import close_event_stream
 from octop.infra.utils.locale import resolve_locale
 
 logger = logging.getLogger(__name__)
@@ -416,7 +416,6 @@ def _steer_user_frame(thread_id: str, bundle: DrainBundle) -> dict[str, Any]:
         "type": "user",
         "content": bundle.text,
         "message_id": bundle.message_id,
-        "client_pending_ids": bundle.client_pending_ids,
         "meta": {"steer": True},
         "thread_id": thread_id,
     }

@@ -1,11 +1,6 @@
 import { request, requestUpload } from "../request";
 
 export const octopAgentsApi = {
-  privateInstance: (agentId: string, signal?: AbortSignal) =>
-    request<{ agent_id: string }>(
-      `/agents/${encodeURIComponent(agentId)}/private-instance`,
-      { method: "POST", signal },
-    ),
   markRead: (agentId: string) =>
     request<void>(`/agents/${encodeURIComponent(agentId)}/read`, {
       method: "POST",

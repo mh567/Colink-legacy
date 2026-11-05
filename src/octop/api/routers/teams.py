@@ -73,10 +73,8 @@ async def create_team(
     server: Any = Depends(get_server),
 ) -> dict[str, Any]:
     teams = _teams(server)
+    member_ids = teams.validate_member_ids(user, body.member_ids)
     assert server.app_runtime is not None
-    member_ids = await teams.resolve_member_ids(
-        user, body.member_ids, server.app_runtime.agent_registry
-    )
     spec = AgentCreateSpec(
         name=body.name.strip(),
         user_id=user.id,
@@ -138,9 +136,7 @@ async def patch_team(
     assert server.app_runtime is not None
     roster_changed = False
     if body.member_ids is not None:
-        next_ids = await teams.resolve_member_ids(
-            user, body.member_ids, server.app_runtime.agent_registry
-        )
+        next_ids = teams.validate_member_ids(user, body.member_ids)
         teams.assert_roster_writable(team_id, next_ids)
         teams.replace_members(team_id, next_ids)
         roster_changed = True

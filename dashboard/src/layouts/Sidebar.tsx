@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { visibleConversations } from "../pages/Messaging/communicationUi";
-import { useCommunication } from "../pages/Messaging/hooks/CommunicationContext";
 import type { TFunction } from "i18next";
 import AvatarDropdown from "../components/AvatarDropdown";
 import AppVersionBadge from "../components/AppVersionBadge";
-import EnterpriseBadge from "../components/EnterpriseBadge";
+import CurrentVersionBadge from "../components/CurrentVersionBadge";
 import { ArrowRightLeft, ChevronDown, X } from "lucide-react";
+import cx from "classnames";
 import { useTheme } from "../context/ThemeContext";
 import { useLayoutMode } from "../context/LayoutModeContext";
 import { useUserRole } from "../hooks/useUserRole";
@@ -26,8 +25,8 @@ import type { MinimalNavPane } from "./layoutModeStorage";
 import MinimalRecordsHost from "./MinimalRecordsHost";
 import SidebarCollapsedIconNav from "./SidebarCollapsedIconNav";
 import SidebarMinimalPaneToggle from "./SidebarMinimalPaneToggle";
-import { useConversationNavigation } from "./ConversationNavigation";
 import { preferencesApi } from "../api/modules/preferences";
+import { publicUrl } from "../utils/publicUrl";
 import {
   COLLAPSED_WIDTH,
   EXPANDED_WIDTH,
@@ -41,7 +40,6 @@ import SidebarNavCustomizer from "./SidebarNavCustomizer";
 import styles from "./Sidebar.module.less";
 import { typeSize } from "../utils/mobileTypeScale";
 import { DESKTOP_DRAG_REGION_CLASS } from "../utils/desktopChrome";
-import { useDesktopWorkspace } from "../context/DesktopWorkspaceContext";
 
 const NAV_GROUPS_STORAGE_KEY = "octop:sidebar-nav-groups";
 const LEGACY_COLLAPSED_GROUP_IDS: Record<string, string> = {
@@ -129,8 +127,9 @@ function NavItemButton({
   active,
   isMobile,
   onNavigate,
-  onExpandChatRail,
-  showChatRailExpand,
+  onToggleChatRail,
+  showChatRailToggle,
+  chatRailOpen,
   role,
   hasUpdate,
   t,
@@ -139,15 +138,20 @@ function NavItemButton({
   active: boolean;
   isMobile?: boolean;
   onNavigate: (path: string) => void;
-  onExpandChatRail?: () => void;
-  showChatRailExpand?: boolean;
+  onToggleChatRail?: () => void;
+  showChatRailToggle?: boolean;
+  /** History rail is currently visible (classic chat route, panel open). */
+  chatRailOpen?: boolean;
   role: string | null;
   hasUpdate: boolean;
   t: TFunction<"translation", undefined>;
 }) {
-  const showExpand = Boolean(
-    showChatRailExpand && item.key === "chat" && onExpandChatRail,
+  const showToggle = Boolean(
+    showChatRailToggle && item.key === "chat" && onToggleChatRail,
   );
+  const railLabel = chatRailOpen
+    ? t("chat.collapseHistorySidebar", "收起对话历史")
+    : t("chat.expandHistorySidebar", "展开对话历史");
 
   return (
     <div
@@ -171,14 +175,13 @@ function NavItemButton({
         type="button"
         className={styles.navItemMain}
         onClick={() => onNavigate(item.path)}
-        title={item.label}
         style={{
           color: active
             ? "var(--fn-sidebar-item-active-text)"
             : "var(--fn-text-secondary)",
           fontSize: typeSize(14, isMobile),
           fontWeight: active ? 500 : 400,
-          paddingRight: showExpand ? 4 : 12,
+          paddingRight: showToggle ? 4 : 12,
         }}
       >
         <span
@@ -204,42 +207,18 @@ function NavItemButton({
             minWidth: 0,
           }}
         >
-          <span
-            style={{
-              minWidth: 0,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
-          >
-            {item.label ?? t(item.labelKey)}
-          </span>
+          {t(item.labelKey)}
           {item.key === "admin-advanced" && role === "admin" && hasUpdate ? (
             <span className={styles.navUpdateBadge}>
               {t("nav.newVersionBadge", "有新版本")}
             </span>
           ) : null}
-          {!!item.unread && (
-            <span
-              style={{
-                fontSize: 11,
-                color: "#fff",
-                background: "#ff4d4f",
-                borderRadius: 10,
-                padding: "0 5px",
-                flexShrink: 0,
-              }}
-            >
-              {item.unread > 99 ? "99+" : item.unread}
-            </span>
-          )}
           {item.badge && (
             <span
               className="nav-badge-new"
               style={{
                 fontSize: typeSize(9, isMobile),
                 fontWeight: 600,
-                color: "#fff",
-                backgroundColor: "#ff4d4f",
                 padding: "1px 4px",
                 borderRadius: "2px",
                 whiteSpace: "nowrap",
@@ -254,16 +233,17 @@ function NavItemButton({
           )}
         </span>
       </button>
-      {showExpand ? (
+      {showToggle ? (
         <button
           type="button"
           className={styles.chatRailExpandBtn}
           onClick={(e) => {
             e.stopPropagation();
-            onExpandChatRail?.();
+            onToggleChatRail?.();
           }}
-          aria-label={t("chat.expandHistorySidebar", "展开对话历史")}
-          title={t("chat.expandHistorySidebar", "展开对话历史")}
+          aria-expanded={Boolean(chatRailOpen)}
+          aria-label={railLabel}
+          title={railLabel}
         >
           <ArrowRightLeft size={14} strokeWidth={1.8} aria-hidden />
         </button>
@@ -276,8 +256,9 @@ function NavList({
   sections,
   selectedKey,
   onNavigate,
-  onExpandChatRail,
-  showChatRailExpand,
+  onToggleChatRail,
+  showChatRailToggle,
+  chatRailOpen,
   isMobile,
   isGroupCollapsed,
   toggleGroup,
@@ -288,8 +269,9 @@ function NavList({
   sections: NavSection[];
   selectedKey: string;
   onNavigate: (path: string) => void;
-  onExpandChatRail?: () => void;
-  showChatRailExpand?: boolean;
+  onToggleChatRail?: () => void;
+  showChatRailToggle?: boolean;
+  chatRailOpen?: boolean;
   isMobile?: boolean;
   isGroupCollapsed: (groupId: string) => boolean;
   toggleGroup: (groupId: string) => void;
@@ -345,8 +327,9 @@ function NavList({
                     active={selectedKey === item.key}
                     isMobile={isMobile}
                     onNavigate={onNavigate}
-                    onExpandChatRail={onExpandChatRail}
-                    showChatRailExpand={showChatRailExpand}
+                    onToggleChatRail={onToggleChatRail}
+                    showChatRailToggle={showChatRailToggle}
+                    chatRailOpen={chatRailOpen}
                     role={role}
                     hasUpdate={hasUpdate}
                     t={t}
@@ -371,9 +354,10 @@ function NavList({
               <ChevronDown
                 size={12}
                 strokeWidth={2}
-                className={`${styles.navGroupChevron} ${
-                  groupCollapsed ? styles.navGroupChevronFolded : ""
-                }`}
+                className={cx(
+                  styles.navGroupChevron,
+                  groupCollapsed && styles.navGroupChevronFolded,
+                )}
                 aria-hidden
               />
             </button>
@@ -387,8 +371,9 @@ function NavList({
                     active={selectedKey === item.key}
                     isMobile={isMobile}
                     onNavigate={onNavigate}
-                    onExpandChatRail={onExpandChatRail}
-                    showChatRailExpand={showChatRailExpand}
+                    onToggleChatRail={onToggleChatRail}
+                    showChatRailToggle={showChatRailToggle}
+                    chatRailOpen={chatRailOpen}
                     role={role}
                     hasUpdate={hasUpdate}
                     t={t}
@@ -410,7 +395,6 @@ export default function Sidebar({
   isMobile,
 }: SidebarProps) {
   const navigate = useNavigate();
-  const conversationPath = useConversationNavigation();
   const location = useLocation();
   const { t } = useTranslation();
   const { isDark } = useTheme();
@@ -419,30 +403,12 @@ export default function Sidebar({
   const setUser = useSetCurrentUser();
   const { hasUpdate } = useUpdateStatus();
   const { mobileEnabled } = useServerCapabilities();
-  const { available: desktopAvailable } = useDesktopWorkspace();
   const { layoutMode, minimalPane, setMinimalPane } = useLayoutMode();
   const isMinimal = layoutMode === "minimal";
   const onChatPath = isChatPath(location.pathname);
-  const { state: communication } = useCommunication();
-  const unread = visibleConversations(communication).reduce(
-    (total, row) => total + (row.muted ? 0 : row.unread ?? 0),
-    0,
-  );
   const catalog = useMemo(
-    () =>
-      buildNavSections(user, {
-        mobileEnabled,
-        unread,
-        companyName: communication.directoryName,
-        desktopAvailable,
-      }),
-    [
-      user,
-      mobileEnabled,
-      unread,
-      communication.directoryName,
-      desktopAvailable,
-    ],
+    () => buildNavSections(user, { mobileEnabled }),
+    [user, mobileEnabled],
   );
   const [savedLayout, setSavedLayout] = useState<SidebarNavLayout | null>(null);
   const [customizerOpen, setCustomizerOpen] = useState(false);
@@ -471,12 +437,14 @@ export default function Sidebar({
     };
   }, [user]);
   const [chatSidebarOpen, setChatSidebarOpen] = useChatSidebarOpen();
-  const showChatRailExpand = !isMinimal && !chatSidebarOpen;
+  // Classic only: keep the control beside Chat whether the history rail is open or closed.
+  const showChatRailToggle = !isMinimal;
+  const chatRailOpen = showChatRailToggle && onChatPath && chatSidebarOpen;
 
   const isRailCollapsed = collapsed && !isMobile;
   const wordmarkSrc = isDark
-    ? "/logo_horizontal_white.png"
-    : "/logo_horizontal_dark.png";
+    ? publicUrl("logo_horizontal_white.png")
+    : publicUrl("logo_horizontal_dark.png");
 
   const selectMinimalPane = useCallback(
     (pane: MinimalNavPane, opts?: { expand?: boolean }) => {
@@ -504,26 +472,38 @@ export default function Sidebar({
   }, [isMinimal, selectMinimalPane]);
 
   const handleNavigate = (path: string) => {
-    navigate(conversationPath(path));
+    // When navigating to /chat, preserve the current chatId in the URL so the
+    // Chat component is not remounted (key stays the same) and the user stays
+    // on their most recent conversation instead of seeing a blank welcome screen.
+    if (path === "/chat" && window.location.pathname.startsWith("/chat/")) {
+      if (isMobile) onToggle();
+      return;
+    }
+    navigate(path);
     if (isMobile) onToggle();
   };
 
-  const handleExpandChatRail = useCallback(() => {
+  const handleToggleChatRail = useCallback(() => {
     if (isMinimal) {
       selectMinimalPane("records", { expand: true });
       return;
     }
+    if (onChatPath && chatSidebarOpen) {
+      setChatSidebarOpen(false);
+      return;
+    }
     window.dispatchEvent(new Event(EXPAND_CHAT_RAIL_EVENT));
     setChatSidebarOpen(true);
-    if (!window.location.pathname.startsWith("/chat")) {
-      navigate(conversationPath("/chat"));
+    if (!onChatPath) {
+      navigate("/chat");
     }
     if (isMobile) onToggle();
   }, [
+    chatSidebarOpen,
     isMinimal,
     isMobile,
     navigate,
-    conversationPath,
+    onChatPath,
     onToggle,
     selectMinimalPane,
     setChatSidebarOpen,
@@ -533,7 +513,7 @@ export default function Sidebar({
     <>
       <img
         src={isRailCollapsed ? "/pwa-192.png" : wordmarkSrc}
-        alt={t("app.productName")}
+        alt="Octop"
         style={{
           height: isRailCollapsed ? 32 : isMobile ? 38 : 36,
           width: isRailCollapsed ? 32 : "auto",
@@ -546,7 +526,7 @@ export default function Sidebar({
       />
       {!isRailCollapsed && !isMobile && (
         <>
-          <EnterpriseBadge isMobile={isMobile} />
+          <CurrentVersionBadge isMobile={isMobile} />
           <AppVersionBadge isMobile={isMobile} />
         </>
       )}
@@ -628,8 +608,9 @@ export default function Sidebar({
       sections={navSections}
       selectedKey={selectedKey}
       onNavigate={handleNavigate}
-      onExpandChatRail={handleExpandChatRail}
-      showChatRailExpand={showChatRailExpand}
+      onToggleChatRail={handleToggleChatRail}
+      showChatRailToggle={showChatRailToggle}
+      chatRailOpen={chatRailOpen}
       isMobile={isMobile}
       isGroupCollapsed={isGroupCollapsed}
       toggleGroup={toggleGroup}
@@ -667,8 +648,8 @@ export default function Sidebar({
               sections={navSections}
               selectedKey={selectedKey}
               onNavigate={handleNavigate}
-              onExpandChatRail={handleExpandChatRail}
-              showChatRailExpand={false}
+              onToggleChatRail={handleToggleChatRail}
+              showChatRailToggle={false}
               isMobile={isMobile}
               isGroupCollapsed={isGroupCollapsed}
               toggleGroup={toggleGroup}
@@ -702,11 +683,7 @@ export default function Sidebar({
       <div
         id={CHAT_HISTORY_RAIL_ID}
         className={styles.minimalRecordsPane}
-        hidden={
-          isRailCollapsed ||
-          minimalPane !== "records" ||
-          selectedKey === "contacts"
-        }
+        hidden={isRailCollapsed || minimalPane !== "records"}
       >
         {!onChatPath ? <MinimalRecordsHost /> : null}
       </div>
@@ -829,7 +806,7 @@ export default function Sidebar({
       }}
     >
       <div
-        className={`${styles.sidebarBrand} ${DESKTOP_DRAG_REGION_CLASS}`}
+        className={cx(styles.sidebarBrand, DESKTOP_DRAG_REGION_CLASS)}
         style={{
           display: "flex",
           alignItems: "center",

@@ -8,7 +8,6 @@ import PageLoading from "../../components/PageLoading";
 import { ServiceRestartProvider } from "../../context/ServiceRestartContext";
 import { BackupOperationProvider } from "../../context/BackupOperationContext";
 import PwaUpdatePrompt from "../../components/PwaUpdatePrompt";
-import ClientConfigUpdatePrompt from "../../components/ClientConfigUpdatePrompt";
 import { PwaAutoPrompt } from "../../components/PwaInstallPrompt";
 import {
   routeConfigs,
@@ -24,13 +23,9 @@ import { useKeyboardOffset } from "../../hooks/useKeyboardOffset";
 import { useChatSidebarOpen } from "../../pages/Chat/hooks/useChatSidebarState";
 import { EXPAND_CHAT_RAIL_EVENT } from "../../pages/Chat/components/ChatSidebarPanel";
 import RequirePermission from "../../components/RequirePermission";
-import PrivateExpertBoundary from "../../components/PrivateExpertBoundary";
 import { routeNeedsPermission } from "../../utils/permissions";
 import { useLayoutMode } from "../../context/LayoutModeContext";
 import { useDashboardPushToast } from "../../hooks/useDashboardPushToast";
-import { useCurrentUser } from "../../hooks/useCurrentUser";
-import { isConversationPath } from "../ConversationNavigation";
-import ConversationRoutes from "../ConversationRoutes";
 
 const Chat = lazy(() => import("../../pages/Chat"));
 const WorkbenchPage = lazy(() => import("../../pages/Control/Workbench"));
@@ -55,18 +50,12 @@ function getSavedCollapsed(): boolean {
  * per thread without remounting the whole page.
  */
 function ChatWithKey() {
-  return (
-    <PrivateExpertBoundary>
-      <Chat />
-    </PrivateExpertBoundary>
-  );
+  return <Chat />;
 }
 
 export default function MainLayout() {
   const location = useLocation();
   const currentPath = location.pathname;
-  const user = useCurrentUser();
-  const isConversationRoute = isConversationPath(currentPath);
   const selectedKey = resolveSelectedKey(currentPath);
   const isMobile = useIsMobile();
   const { layoutMode } = useLayoutMode();
@@ -164,18 +153,17 @@ export default function MainLayout() {
     return () => window.removeEventListener(EXPAND_CHAT_RAIL_EVENT, handler);
   }, [collapsed, isMinimalLayout, persistNavCollapsed, setChatSidebarOpen]);
 
-  const routeElements = routeConfigs.map((rc) => {
-    let el = rc.useWrapper ? <ChatWithKey /> : rc.element;
-    if (!rc.useWrapper && routeNeedsPermission(rc.path)) {
-      el = <RequirePermission>{el}</RequirePermission>;
-    }
-    return <Route key={rc.path} path={rc.path} element={el} />;
-  });
-  const routes = isConversationRoute ? (
-    <ConversationRoutes key={user?.id}>{routeElements}</ConversationRoutes>
-  ) : (
+  const routes = (
     <Suspense fallback={<PageLoading />}>
-      <Routes>{routeElements}</Routes>
+      <Routes>
+        {routeConfigs.map((rc) => {
+          let el = rc.useWrapper ? <ChatWithKey /> : rc.element;
+          if (!rc.useWrapper && routeNeedsPermission(rc.path)) {
+            el = <RequirePermission>{el}</RequirePermission>;
+          }
+          return <Route key={rc.path} path={rc.path} element={el} />;
+        })}
+      </Routes>
     </Suspense>
   );
 
@@ -241,10 +229,30 @@ export default function MainLayout() {
                 expanded={!collapsed}
                 onToggle={handleNavRailToggle}
                 side="end"
+                placement={
+                  isChatRoute && !isMinimalLayout && !chatSidebarOpen
+                    ? "before"
+                    : "center"
+                }
               />
             )}
           </div>
 
+          {isChatRoute && !isMinimalLayout && (
+            <div
+              id={CHAT_HISTORY_RAIL_ID}
+              style={{
+                flexShrink: 0,
+                display: "flex",
+                alignSelf: "stretch",
+                minHeight: 0,
+                height: "100%",
+                position: "relative",
+              }}
+            />
+          )}
+
+          {/* Right column: mobile header (if any) + page content */}
           <div
             style={{
               flex: 1,
@@ -255,133 +263,96 @@ export default function MainLayout() {
               overflow: "hidden",
             }}
           >
-            <div
-              style={{
-                display: "flex",
-                flex: 1,
-                minHeight: 0,
-                minWidth: 0,
-                overflow: "hidden",
-              }}
-            >
-              {isConversationRoute && !isMinimalLayout && (
-                <div
-                  id={CHAT_HISTORY_RAIL_ID}
-                  style={{
-                    flexShrink: 0,
-                    display: isChatRoute ? "flex" : "none",
-                    alignSelf: "stretch",
-                    minHeight: 0,
-                    height: "100%",
-                    position: "relative",
-                  }}
+            {isMobile &&
+              !(
+                SELF_HEADER_PATHS.has(currentPath) ||
+                [...SELF_HEADER_PATHS].some((p) =>
+                  currentPath.startsWith(p + "/"),
+                )
+              ) && (
+                <Header
+                  selectedKey={selectedKey}
+                  collapsed={collapsed}
+                  onToggle={toggleCollapsed}
+                  isMobile={isMobile}
                 />
               )}
 
-              {/* Right column: mobile header (if any) + page content */}
-              <div
+            <Layout
+              style={{
+                background: "transparent",
+                flex: 1,
+                display: "flex",
+                flexDirection: "column",
+                overflow: "hidden",
+                minWidth: 0,
+                minHeight: 0,
+              }}
+            >
+              <Content
+                className="page-container"
                 style={{
+                  background: isChatRoute
+                    ? "var(--fn-bg-elevated, #fff)"
+                    : "var(--fn-bg-layout)",
+                  transition: "background var(--fn-transition)",
                   flex: 1,
-                  minWidth: 0,
-                  minHeight: 0,
+                  overflow: "hidden",
                   display: "flex",
                   flexDirection: "column",
-                  overflow: "hidden",
+                  minHeight: 0,
                 }}
               >
-                {isMobile &&
-                  !(
-                    SELF_HEADER_PATHS.has(currentPath) ||
-                    [...SELF_HEADER_PATHS].some((p) =>
-                      currentPath.startsWith(p + "/"),
-                    )
-                  ) && (
-                    <Header
-                      selectedKey={selectedKey}
-                      collapsed={collapsed}
-                      onToggle={toggleCollapsed}
-                      isMobile={isMobile}
-                    />
-                  )}
+                <PwaUpdatePrompt />
+                <PwaAutoPrompt />
 
-                <Layout
-                  style={{
-                    background: "transparent",
-                    flex: 1,
-                    display: "flex",
-                    flexDirection: "column",
-                    overflow: "hidden",
-                    minWidth: 0,
-                    minHeight: 0,
-                  }}
-                >
-                  <Content
-                    className="page-container"
+                {workbenchMounted && (
+                  <div
                     style={{
-                      background: isChatRoute
-                        ? "var(--fn-bg-elevated, #fff)"
-                        : "var(--fn-bg-layout)",
-                      transition: "background var(--fn-transition)",
                       flex: 1,
-                      overflow: "hidden",
-                      display: "flex",
-                      flexDirection: "column",
                       minHeight: 0,
+                      overflow: "hidden",
+                      display: onWorkbench ? "flex" : "none",
+                      flexDirection: "column",
                     }}
                   >
-                    <PwaUpdatePrompt />
-                    <ClientConfigUpdatePrompt />
-                    <PwaAutoPrompt />
+                    <RequirePermission>
+                      <Suspense fallback={<PageLoading />}>
+                        <WorkbenchPage isVisible={onWorkbench} />
+                      </Suspense>
+                    </RequirePermission>
+                  </div>
+                )}
 
-                    {workbenchMounted && (
-                      <div
-                        style={{
-                          flex: 1,
-                          minHeight: 0,
-                          overflow: "hidden",
-                          display: onWorkbench ? "flex" : "none",
-                          flexDirection: "column",
-                        }}
-                      >
-                        <RequirePermission>
-                          <Suspense fallback={<PageLoading />}>
-                            <WorkbenchPage isVisible={onWorkbench} />
-                          </Suspense>
-                        </RequirePermission>
-                      </div>
-                    )}
-
-                    {/* Keep Routes mounted when visiting Workbench so leaving/re-entering
+                {/* Keep Routes mounted when visiting Workbench so leaving/re-entering
                   does not remount every lazy page (lag + lost UI state). */}
+                <div
+                  style={{
+                    flex: 1,
+                    minHeight: 0,
+                    overflow: "hidden",
+                    display: onWorkbench ? "none" : "flex",
+                    flexDirection: "column",
+                  }}
+                >
+                  {isFullscreen ? (
                     <div
                       style={{
                         flex: 1,
                         minHeight: 0,
                         overflow: "hidden",
-                        display: onWorkbench ? "none" : "flex",
+                        display: "flex",
                         flexDirection: "column",
                       }}
                     >
-                      {isFullscreen ? (
-                        <div
-                          style={{
-                            flex: 1,
-                            minHeight: 0,
-                            overflow: "hidden",
-                            display: "flex",
-                            flexDirection: "column",
-                          }}
-                        >
-                          {routes}
-                        </div>
-                      ) : (
-                        <div className="page-content">{routes}</div>
-                      )}
+                      {routes}
                     </div>
-                  </Content>
-                </Layout>
-              </div>
-            </div>
+                  ) : (
+                    <div className="page-content">{routes}</div>
+                  )}
+                </div>
+              </Content>
+            </Layout>
           </div>
         </div>
       </BackupOperationProvider>

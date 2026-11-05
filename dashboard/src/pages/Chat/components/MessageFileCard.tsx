@@ -2,6 +2,8 @@ import { useCallback, useState } from "react";
 import { Download, Eye, Paperclip } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { downloadAuthFile } from "../../../components/AuthFileDownloadLink";
+import { saveBlobAsFile } from "../../../utils/saveBlobAsFile";
+import { isDesktopShell } from "../../../utils/desktopChrome";
 import {
   isDataUrl,
   needsAuthBlobFetch,
@@ -14,10 +16,6 @@ import { useChatFilePreview } from "../ChatFilePreviewContext";
 import styles from "../index.module.less";
 
 import { message as antMessage } from "@/utils/antdMessage";
-import {
-  requireDesktopRuntime,
-  type LocalArtifact,
-} from "../../../api/desktopRuntime";
 
 /** Files the browser can render inline (vs. pure binary blobs). */
 function isPreviewable(name: string): boolean {
@@ -34,13 +32,11 @@ export function MessageFileCard({
   filename,
   agentId,
   workspacePath,
-  localFile,
 }: {
   url: string;
   filename?: string;
   agentId?: string | null;
   workspacePath?: string;
-  localFile?: LocalArtifact;
 }) {
   const { t } = useTranslation();
   const filePreview = useChatFilePreview();
@@ -50,28 +46,25 @@ export function MessageFileCard({
 
   const resolvedPath = workspacePath || workspacePathFromAccessUrl(url) || "";
   const previewable = Boolean(
-    !localFile &&
-      resolvedPath &&
-      agentId &&
-      isPreviewable(label) &&
-      filePreview,
+    resolvedPath && agentId && isPreviewable(label) && filePreview,
   );
 
   const handleDownload = useCallback(async () => {
-    if (localFile) {
-      try {
-        await requireDesktopRuntime().reveal({
-          path: localFile.path,
-          sha256: localFile.sha256,
-        });
-      } catch (error) {
-        antMessage.error(
-          error instanceof Error ? error.message : "无法打开文件位置",
-        );
-      }
-      return;
-    }
     if (!needsAuth) {
+      if (isDesktopShell()) {
+        setLoading(true);
+        try {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error("download failed");
+          const blob = await res.blob();
+          await saveBlobAsFile(blob, filename || "download");
+        } catch {
+          antMessage.error(t("chat.downloadFailed", "下载失败，请重试"));
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
       const a = document.createElement("a");
       a.href = url;
       a.download = filename || "download";
@@ -90,7 +83,7 @@ export function MessageFileCard({
     } finally {
       setLoading(false);
     }
-  }, [url, filename, needsAuth, t, localFile]);
+  }, [url, filename, needsAuth, t]);
 
   const openPreview = useCallback(() => {
     if (previewable && resolvedPath && filePreview) {
@@ -130,8 +123,8 @@ export function MessageFileCard({
           void handleDownload();
         }}
         disabled={loading}
-        title={localFile ? "打开文件位置" : t("common.download")}
-        aria-label={localFile ? "打开文件位置" : t("common.download")}
+        title={t("common.download")}
+        aria-label={t("common.download")}
       >
         <Download size={15} strokeWidth={2} />
       </button>

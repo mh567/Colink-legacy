@@ -342,9 +342,7 @@ function ItemList({
               <GripVertical size={14} />
             </span>
             <span className={styles.itemIcon}>{item.icon}</span>
-            <span className={styles.itemLabel} title={item.label}>
-              {item.label ?? t(item.labelKey)}
-            </span>
+            <span className={styles.itemLabel}>{t(item.labelKey)}</span>
             <Button
               type="text"
               size="small"

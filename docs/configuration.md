@@ -1,9 +1,6 @@
 # Configuration
 
-> For Octop Enterprise deployment (PostgreSQL, communication, devices and isolation), use the [enterprise deployment and recovery guide](../docker/enterprise/README_EN.md). This document covers general application configuration; single-process descriptions apply to base mode.
-
-In base mode, Octop stores its state under `~/.octop/`. Enterprise mode
-uses PostgreSQL for control-plane data and retains local files as configured. The directory is created
+Octop stores all of its state under `~/.octop/`. The directory is created
 on first server start (or by `octop init` / `octop run`).
 
 ## Filesystem layout
@@ -13,7 +10,7 @@ on first server start (or by `octop init` / `octop run`).
 ├── config.json              # process-level settings (host, port, CORS, DB, TLS, …)
 ├── env                      # optional dotenv (OCTOP_DATABASE_*, API keys, …); loaded at server start
 ├── octop.db                 # SQLite — users, agents, providers, sessions, audit
-├── cli_state.json           # pinned acting user and default agent (no CLI login token)
+├── cli_state.json           # CLI token + pinned defaults (`octop user login`)
 ├── repl_history             # readline-style history for `octop chats repl`
 ├── secrets/
 │   └── jwt_secret           # 32-byte random; rotate with `octop admin rotate-jwt-secret`
@@ -25,15 +22,10 @@ on first server start (or by `octop init` / `octop run`).
 ```
 
 `env` is dotenv format, applied before `config.json` is loaded
-(`OctopServer.start` → `apply_env_file`). Dashboard **Application Settings → Environment
-Variables** writes this file. Saving **replaces** the file and drops removed
+(`OctopServer.start` → `apply_env_file`). Dashboard **Advanced → Environment
+variables** writes this file. Saving **replaces** the file and drops removed
 keys from the process environment (host/systemd keys that were never in the
-file are left alone). The following environment inheritance rules describe base
-mode. Enterprise Docker isolation filters host variables and disables host tools;
-the employee local runtime runs on the employee computer instead. See
-[employee isolation](employee-isolation.md) and the [employee guide](enterprise-client_EN.md).
-
-In base mode:
+file are left alone). Every running agent inherits those keys:
 
 - **Local shell** — live process env (including this file) plus the agent's
   workspace `.env` (workspace wins on the same key; `OCTOP_*` / `HOME` / `USER`
@@ -60,6 +52,41 @@ That file is excluded from published-expert snapshots.
 The root can be overridden with `OCTOP_HOME` (absolute path). Most
 sub-paths are exposed as properties on `PathLayout` in
 `octop.infra.utils.paths`.
+
+## Local knowledge indexing and systemd resource limits
+
+Local ONNX embeddings process one chunk at a time with two inference threads.
+Indexing, retrieval, and model probes share one cached model per process and
+serialize inference. Switching the model or `OCTOP_HOME`, or deleting the cached
+model, releases the resident session. Knowledge indexing processes one document
+at a time; large imports continue in the background.
+
+On Linux, `octop service start` and `octop service restart` install/update
+`octop.service.d/15-resource-limits.conf` alongside the existing service unit.
+The main unit, custom `ExecStart`, service user, and other drop-ins are preserved.
+Defaults are `MemoryHigh=60%` and `MemoryMax=75%` of physical RAM,
+`MemorySwapMax=512M`, `OOMPolicy=kill`, a 30-second restart delay, and at most three
+starts within ten minutes. These limits cover the whole service and its children;
+they are a host safeguard, not a guarantee that every model fits. Memory controls
+require the corresponding systemd/cgroup support (user services need cgroup v2
+with the memory controller available).
+
+To set a machine-specific budget, use `systemctl --user edit octop.service`
+(or `sudo systemctl edit octop.service` for a system service). For example:
+
+```ini
+[Service]
+MemoryHigh=5G
+MemoryMax=6G
+MemorySwapMax=512M
+```
+
+The resulting `override.conf` sorts after the managed defaults and survives
+future service updates. Restart the service to apply it. If repeated failures
+hit the start limit, correct the cause before running
+`systemctl --user reset-failed octop.service` and starting the service again
+(omit `--user` for a system service). Foreground, Docker, and macOS launchd
+deployments retain their own process/container resource policies.
 
 ## `config.json`
 
@@ -144,9 +171,9 @@ Each variable, when set, takes precedence over the matching key in
 | `OCTOP_BIND_HOST` | string | `127.0.0.1` | Listen address (use `0.0.0.0` for LAN access) |
 | `OCTOP_PORT` | int | `8088` | Listen port (`0`–`65535`; `0` asks the OS for a free port) |
 | `OCTOP_LOG_LEVEL` | string | `info` | One of `debug` `info` `warning` `error` |
-| `OCTOP_LOG_RETENTION_DAYS` | int | `14` | Keep rotated `octop.log.YYYY-MM-DD` files for this many days |
+| `OCTOP_LOG_RETENTION_DAYS` | int | `14` | Keep rotated `octop.YYYY-MM-DD.log` files for this many days |
 | `OCTOP_LOG_MAX_BYTES` | int | `104857600` (100 MiB) | Roll the active log when it exceeds this size (in addition to daily rotation) |
-| `OCTOP_LOG_COMPRESS` | bool | `true` | logrotate-style `compress` + `delaycompress`: gzip prior rotated plains on the next cycle (`octop.log.YYYY-MM-DD.gz`); the newest rotated file stays uncompressed until then |
+| `OCTOP_LOG_COMPRESS` | bool | `true` | logrotate-style `compress` + `delaycompress`: gzip prior rotated plains on the next cycle (`octop.YYYY-MM-DD.log.gz`); the newest rotated file stays uncompressed until then |
 | `OCTOP_ACCESS_TOKEN_TTL` | int (seconds) | `86400` | JWT access-token lifetime |
 | `OCTOP_LOGIN_MAX_ATTEMPTS` | int | `5` | Failed-login attempts before lockout |
 | `OCTOP_LOGIN_LOCKOUT_SECONDS` | int | `900` | Lockout duration after `OCTOP_LOGIN_MAX_ATTEMPTS` failures |
@@ -159,7 +186,6 @@ Each variable, when set, takes precedence over the matching key in
 | `OCTOP_DEFAULT_TIMEZONE` | IANA tz | `Asia/Shanghai` | Default timezone for display, scheduling, and harness (`cron_timezone` / `OCTOP_CRON_TIMEZONE` still accepted) |
 | `OCTOP_CORS_ORIGINS` | comma-sep list | empty | Permitted CORS origins for the dashboard / external callers |
 | `OCTOP_ENABLE_DASHBOARD` | bool | `true` | Serve the built React SPA at `/` |
-| `OCTOP_DASHBOARD_CDN_HOSTS` | comma-sep hostnames | empty | Select an optional `dashboard/cdn/` build only on these public hosts; LAN and other hosts retain the local build |
 | `OCTOP_ENABLE_API_DOCS` | bool | `false` | Expose Scalar API docs at `/api/docs` |
 | `OCTOP_REQUIRE_SETUP_PASSWORD` | bool | `true` | Require wizard password during initial setup |
 | `OCTOP_MAX_UPLOAD_MB` | int | `100` | Max upload size in MiB for chat attachments, IM inbound, and knowledge documents (1–1024) |
@@ -178,6 +204,10 @@ Each variable, when set, takes precedence over the matching key in
 | `OCTOP_AGENT` | string | empty | Default `--agent` for CLI subcommands |
 | `OCTOP_SERVICE_MODE` | `systemd` \| `launchd` | auto | Override the service backend (used by `octop service`) |
 | `OCTOP_SERVICE_SCOPE` | `user` \| `system` | auto | systemd `--user` vs system unit (Linux only) |
+| `OCTOP_PORTAL_ORIGIN` | origin | `https://octop.cloud` | Plugin and expert catalog origin. No path. Empty disables the remote catalog. See [private market](private-market.md) |
+| `OCTOP_MARKET_REMOTE_ORIGIN` | origin | `https://download.octop.cloud` | Origin allowed for market archive `download_url` values. Any path on that origin is accepted. The variable itself has no path. See [private market](private-market.md) |
+| `SKILL_MARKET_ORIGIN` | origin | `https://api.skillhub.cn` | Skill search, rankings, and per-skill zip download. No path. Empty keeps the default. See [skill market](skill-market.md) |
+| `SKILLSET_ORIGIN` | origin | `https://api.skillhub.cn` | Skillset detail and skillset package used when importing a skill package. No path. Empty keeps the default. See [skill market](skill-market.md) |
 
 Invalid integer values are logged and ignored — the on-disk default
 remains in effect. `database_env_configured()` returns `True` when any
@@ -188,6 +218,16 @@ configured backend at boot.
 they are listed under `environment:` in `docker/docker-compose.yml`
 (Compose uses `.env` for interpolation only; unset keys do not enter the
 container). Writing the same keys to the mounted `~/.octop/env` also works.
+
+When `database.driver` is `postgresql`, skill-package sources and knowledge-base
+originals are stored in that same database (`public.skill_package_files` and
+`public.knowledge_files`), and knowledge vectors use pgvector
+(`public.knowledge_chunks`). Names sit next to `skill_packages` and
+`knowledge_bases`. SQLite keeps the local `skill-packages/` and
+`knowledge/` directories. The `vector` extension is not created by Octop
+migrations; enable it with `docker/postgres/init-vector.sql` or
+`CREATE EXTENSION vector` before indexing knowledge. There is no sqlite→PostgreSQL
+content migration in this release — pick the driver at install time.
 
 ### Agent memory vs control plane
 
@@ -250,8 +290,8 @@ octop admin rotate-jwt-secret
 Rotation invalidates every outstanding access token immediately. The
 old secret is overwritten in place — no zero-downtime rotation today.
 
-Per-agent provider credentials (e.g. API keys) live in the control-plane
-`providers` table (SQLite or PostgreSQL) and are surfaced through
+Per-agent provider credentials (e.g. API keys) live in the SQLite
+`providers` table and are surfaced through
 `infra/connectors/credential_crypto.py` for connector OAuth flows.
 
 ## Optional segmented history archive
@@ -262,5 +302,5 @@ This switch only affects the write format of the next complete turn —
 once disabled, turns already saved in the new format are still read
 correctly.
 Before enabling, read
-[Segmented history archive & rollback](versioned-history.md) (Chinese), especially
+[Segmented history archive & rollback](versioned-history.md), especially
 the version compatibility and backup/restore boundaries it covers.

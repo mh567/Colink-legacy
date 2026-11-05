@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -38,6 +37,7 @@ class ContextBreakdownResult:
     max_tokens: int
     used_tokens: int
     segments: dict[str, int]
+    decision_saved: int = 0
 
 
 def _empty_breakdown(*, max_tokens: int) -> ContextBreakdownResult:
@@ -54,7 +54,13 @@ def _usage_to_breakdown(usage: Any, *, fallback_max_tokens: int) -> ContextBreak
     segments = {key: int(raw_segments.get(key, 0) or 0) for key in SEGMENT_KEYS}
     used = int(getattr(usage, "used_tokens", 0) or 0)
     cap = int(getattr(usage, "max_tokens", fallback_max_tokens) or fallback_max_tokens or 128_000)
-    return ContextBreakdownResult(max_tokens=cap, used_tokens=used, segments=segments)
+    saved = _token_int(getattr(usage, "decision_saved", 0))
+    return ContextBreakdownResult(
+        max_tokens=cap,
+        used_tokens=used,
+        segments=segments,
+        decision_saved=saved,
+    )
 
 
 def _from_stream_input_tokens(input_tokens: int, *, max_tokens: int) -> ContextBreakdownResult:
@@ -62,8 +68,7 @@ def _from_stream_input_tokens(input_tokens: int, *, max_tokens: int) -> ContextB
     cap = max_tokens if max_tokens > 0 else 128_000
     used = min(max(0, input_tokens), cap)
     segments = dict.fromkeys(SEGMENT_KEYS, 0)
-    # The ledger knows the total, not its composition. Tool schemas and system
-    # prompts are included in input usage too; do not label all of it dialogue.
+    segments["conversation"] = used
     return ContextBreakdownResult(max_tokens=cap, used_tokens=used, segments=segments)
 
 
@@ -149,7 +154,8 @@ def usage_dict_from_message(msg: Any) -> dict[str, Any] | None:
     if inp == 0 and out == 0:
         inp, out = _io_from_mapping(mapped_response)
 
-    if inp == 0 and out == 0:
+    saved = _token_int(stamped.get("decision_saved")) if isinstance(stamped, dict) else 0
+    if inp == 0 and out == 0 and saved == 0:
         return None
     payload: dict[str, Any] = {
         "input_tokens": inp,
@@ -188,6 +194,8 @@ def usage_dict_from_message(msg: Any) -> dict[str, Any] | None:
                 "model_calls": 1,
             }
         )
+    if saved:
+        payload["decision_saved"] = saved
     return payload
 
 
@@ -201,9 +209,8 @@ async def compute_context_breakdown(
     mcp_servers: list[str] | None = None,
     skills: list[str] | None = None,
     usage_repo: Any | None = None,
-    message_repo: Any | None = None,
 ) -> ContextBreakdownResult:
-    """Return live or persisted request metadata, then a token-ledger fallback.
+    """Return a non-blocking context snapshot or a token-ledger fallback.
 
     ``mcp_servers`` / ``skills`` are accepted for dashboard query compatibility
     but unused — the live harness snapshot already reflects the filtered request.
@@ -237,21 +244,6 @@ async def compute_context_breakdown(
 
     if _usage_has_segments(usage):
         return _usage_to_breakdown(usage, fallback_max_tokens=max_tokens)
-
-    persisted_getter = getattr(message_repo, "last_context_usage", None)
-    if callable(persisted_getter):
-        try:
-            stamped = await asyncio.get_running_loop().run_in_executor(
-                None, persisted_getter, thread_id
-            )
-            if isinstance(stamped, dict):
-                from octop_harness.context_usage import ContextUsage  # noqa: PLC0415
-
-                persisted = ContextUsage.from_dict(stamped).with_max_tokens(max_tokens)
-                if _usage_has_segments(persisted):
-                    return _usage_to_breakdown(persisted, fallback_max_tokens=max_tokens)
-        except (TypeError, ValueError, AttributeError):
-            logger.debug("invalid context metadata for thread=%s", thread_id, exc_info=True)
 
     logged = 0
     if usage_repo is not None:

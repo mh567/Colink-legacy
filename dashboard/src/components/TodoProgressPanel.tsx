@@ -6,6 +6,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import cx from "classnames";
 import {
   countCompletedTodos,
   type TodoListItem,
@@ -33,13 +34,11 @@ export function TodoListView({
   isStreaming = false,
   className,
   variant = "inline",
-  showHeader = true,
 }: {
   items: readonly TodoListItem[];
   isStreaming?: boolean;
   className?: string;
   variant?: "inline" | "panel";
-  showHeader?: boolean;
 }) {
   const { t } = useTranslation();
   if (items.length === 0) return null;
@@ -48,28 +47,24 @@ export function TodoListView({
 
   return (
     <div
-      className={[
+      className={cx(
         styles.todoListBlock,
-        variant === "panel" ? styles.todoProgressPanel : null,
+        variant === "panel" && styles.todoProgressPanel,
         className,
-      ]
-        .filter(Boolean)
-        .join(" ")}
+      )}
     >
-      {showHeader ? (
-        <div className={styles.todoListHeader}>
-          <div className={styles.todoListTitle}>
-            {t("chatUsage.todoListTitle", "Task progress")}
-          </div>
-          <div className={styles.todoListSummary}>
-            {t("chatUsage.todoListSummary", {
-              completed,
-              total: items.length,
-              defaultValue: "{{completed}}/{{total}} done",
-            })}
-          </div>
+      <div className={styles.todoListHeader}>
+        <div className={styles.todoListTitle}>
+          {t("chatUsage.todoListTitle", "Task progress")}
         </div>
-      ) : null}
+        <div className={styles.todoListSummary}>
+          {t("chatUsage.todoListSummary", {
+            completed,
+            total: items.length,
+            defaultValue: "{{completed}}/{{total}} done",
+          })}
+        </div>
+      </div>
       <ul className={styles.todoListItems}>
         {items.map((item) => (
           <li key={item.id} className={styles.todoListItem}>
@@ -77,13 +72,14 @@ export function TodoListView({
               {statusIcon(item.status, isStreaming)}
             </span>
             <span
-              className={`${styles.todoListText} ${
+              className={cx(
+                styles.todoListText,
                 item.status === "completed"
                   ? styles.todoListTextCompleted
                   : item.status === "cancelled"
                   ? styles.todoListTextCancelled
-                  : ""
-              }`}
+                  : "",
+              )}
             >
               {item.content}
             </span>

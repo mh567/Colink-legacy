@@ -10,22 +10,14 @@ const LANGUAGES = [
   { key: "en", label: "EN" },
 ];
 
-export default function LanguageSwitcher({
-  guest = false,
-}: {
-  guest?: boolean;
-}) {
+export default function LanguageSwitcher() {
   const { i18n, t } = useTranslation();
   const currentLanguage = i18n.language?.startsWith("zh") ? "zh" : "en";
 
   const changeLanguage = async (lang: string) => {
     try {
-      if (guest) {
-        await applyUserLocale(lang);
-      } else {
-        const prefs = await preferencesApi.setLocale(lang);
-        await applyUserLocale(prefs.locale);
-      }
+      const prefs = await preferencesApi.setLocale(lang);
+      await applyUserLocale(prefs.locale);
     } catch {
       message.error(
         t("language.saveFailed", "Failed to save language preference"),
@@ -53,9 +45,6 @@ export default function LanguageSwitcher({
             mouseEnterDelay={0.4}
           >
             <button
-              type="button"
-              aria-label={key === "zh" ? "简体中文" : "English"}
-              aria-pressed={active}
               onClick={() => void changeLanguage(key)}
               style={{
                 display: "flex",

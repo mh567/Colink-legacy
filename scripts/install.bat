@@ -1,6 +1,4 @@
 @echo off
-echo Octop Enterprise: use source deployment from docker/enterprise/README.md. The upstream installer is disabled for this distribution. 1>&2
-exit /b 1
 setlocal EnableDelayedExpansion
 
 REM Octop Installer for Windows (cmd.exe)

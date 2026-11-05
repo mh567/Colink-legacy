@@ -1,5 +1,6 @@
 import type { TFunction } from "i18next";
 import { Tooltip } from "antd";
+import cx from "classnames";
 import { prefetchRoute } from "../routes/prefetch";
 import { COLLAPSED_WIDTH, type NavItem } from "./sidebarNav";
 import styles from "./Sidebar.module.less";
@@ -28,7 +29,7 @@ export default function SidebarCollapsedIconNav({
         return (
           <Tooltip
             key={item.key}
-            title={`${item.label ?? t(item.labelKey)}${
+            title={`${t(item.labelKey)}${
               showUpdateBadge
                 ? ` (${t("nav.newVersionBadge", "有新版本")})`
                 : item.badge
@@ -40,7 +41,6 @@ export default function SidebarCollapsedIconNav({
           >
             <button
               type="button"
-              aria-label={item.label ?? t(item.labelKey)}
               onClick={() => onNavigate(item.path)}
               style={{
                 display: "flex",
@@ -78,27 +78,14 @@ export default function SidebarCollapsedIconNav({
               {item.icon}
               {showUpdateBadge ? (
                 <span
-                  className={`${styles.navUpdateBadge} ${styles.navUpdateBadgeCollapsed}`}
+                  className={cx(
+                    styles.navUpdateBadge,
+                    styles.navUpdateBadgeCollapsed,
+                  )}
                 >
-                  新
+                  {t("nav.newVersionBadgeShort", "新")}
                 </span>
               ) : null}
-              {!!item.unread && (
-                <span
-                  style={{
-                    position: "absolute",
-                    right: 2,
-                    top: 2,
-                    fontSize: 9,
-                    color: "#fff",
-                    background: "#ff4d4f",
-                    borderRadius: 10,
-                    padding: "1px 3px",
-                  }}
-                >
-                  {item.unread > 99 ? "99+" : item.unread}
-                </span>
-              )}
               {item.badge && (
                 <span
                   className="nav-badge-new nav-badge-new--collapsed"
@@ -109,8 +96,6 @@ export default function SidebarCollapsedIconNav({
                     zIndex: 2,
                     fontSize: 7,
                     fontWeight: 700,
-                    color: "#fff",
-                    backgroundColor: "#ff4d4f",
                     width: 14,
                     height: 14,
                     display: "flex",

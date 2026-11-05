@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import shutil
 import threading
@@ -27,7 +26,8 @@ from octop.i18n.domains.agents import (
 )
 from octop.infra.agents.memory.backend import memory_backend_from_agent_config
 from octop.infra.agents.memory.slim import MemorySlimCoordinator
-from octop.infra.agents.providers import ProviderStore, sync_providers_to_harness
+from octop.infra.agents.providers import HostModelFactory, ProviderStore, sync_providers_to_harness
+from octop.infra.agents.providers.health import ModelHealthRegistry
 from octop.infra.agents.security import SecuritySettingsStore, ToolGuardRulesStore
 from octop.infra.agents.security.hitl_session import (
     HitlSessionPolicyStore,
@@ -36,6 +36,7 @@ from octop.infra.agents.security.hitl_session import (
     thread_id_from_request,
 )
 from octop.infra.agents.settings.acp import ACPSettingsStore
+from octop.infra.agents.settings.decision import DecisionSettings, DecisionSettingsStore
 from octop.infra.agents.settings.langfuse import LangfuseSettings, LangfuseSettingsStore
 from octop.infra.agents.settings.media_generation import (
     MediaGenerationSettings,
@@ -82,7 +83,7 @@ from octop.infra.skills.workspace_catalog import (
     list_workspace_skill_summaries,
     repair_workspace_skill_manifests,
 )
-from octop.infra.utils.locale import Locale
+from octop.infra.utils.locale import Locale, resolve_user_locale
 from octop.infra.utils.turn_failure import turn_model_scope
 from octop.infra.utils.ulid import new_short_id
 
@@ -105,8 +106,8 @@ def _model_retry_on_failure(
     agent_id: str = "",
     manager: AgentManager | None = None,
 ) -> str:
-    # Feed a specific, model-visible prompt instead of raising. Inbox jobs still
-    # mark failed when the reply carries MODEL_RETRY_FAILURE_MARK.
+    # Legacy formatter for callers that explicitly request a recovery prompt.
+    # Active agents use on_failure="error"; their entry points log the exception.
     from octop.i18n.domains.stream import exception_display_message, model_retry_failure_prompt
     from octop.infra.agents.security.hitl_session import current_hitl_thread_id
     from octop.infra.metrics import METRICS
@@ -176,6 +177,20 @@ def skill_package_ids_list(cfg: dict[str, Any]) -> list[str]:
     return [str(item) for item in raw if str(item).strip()]
 
 
+def _stored_id_list(value: Any) -> list[str]:
+    """Normalize a persisted id list, whether it is already a list or JSON text."""
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed if str(item).strip()]
+    return []
+
+
 def _memory_aux_model_settings(
     mem: dict[str, Any],
     supported_fields: frozenset[str],
@@ -204,6 +219,20 @@ def _memory_aux_model_settings(
         return {}
     # One user-chosen model drives both extraction tiers.
     return {"memory_aux_light_model": ref, "memory_aux_heavy_model": ref}
+
+
+def memory_extract_supported_options() -> list[str]:
+    """Call options supported by the installed harness, for the settings UI."""
+    fields = {
+        "extract_max_tokens": "memory_extract_max_tokens",
+        "extract_light_timeout_s": "memory_aux_light_timeout_s",
+        "extract_heavy_timeout_s": "memory_aux_heavy_timeout_s",
+        "extract_thinking": "memory_aux_thinking",
+        "extract_extra_body": "memory_aux_extra_body",
+        "extract_max_retries": "memory_aux_max_retries",
+        "extract_retry_backoff_s": "memory_aux_retry_backoff_s",
+    }
+    return [key for key, field in fields.items() if field in _HARNESS_AGENT_CONFIG_FIELDS]
 
 
 def _memory_extract_settings(
@@ -245,7 +274,7 @@ def _memory_extract_settings(
         ):
             out[dst] = float(val)
 
-    # Aux-call options (#1360): read timeouts per tier, a default completion
+    # Aux-call options (#1360): read timeouts per tier, an extraction output
     # budget, and vendor request extras for the aux LLM. Forward-compat: only
     # forwarded when the installed octop-harness knows the field.
     for src, dst in (
@@ -259,29 +288,40 @@ def _memory_extract_settings(
             and not isinstance(val, bool)
             and val > 0
         ):
-            out[dst] = float(val)
+            # Older API versions accepted timeouts beyond harness limits.
+            out[dst] = max(30.0, min(3600.0, float(val)))
     max_tokens = mem.get("extract_max_tokens")
-    # Harness 1.0.2 applies the extraction budget through this field; the
-    # auxiliary-client fallback does not override the extractor's own budget.
-    budget_field = (
-        "memory_extract_max_tokens"
-        if "memory_extract_max_tokens" in supported_fields
-        else "memory_aux_max_tokens"
-    )
     if (
-        budget_field in supported_fields
+        "memory_extract_max_tokens" in supported_fields
         and isinstance(max_tokens, int)
         and not isinstance(max_tokens, bool)
         and max_tokens > 0
     ):
-        out[budget_field] = max_tokens
+        out["memory_extract_max_tokens"] = max(128, min(65536, max_tokens))
+    thinking = mem.get("extract_thinking")
+    if thinking in ("auto", "off", "on") and "memory_aux_thinking" in supported_fields:
+        out["memory_aux_thinking"] = thinking
+    for src, dst in (
+        ("extract_max_retries", "memory_aux_max_retries"),
+        ("extract_retry_backoff_s", "memory_aux_retry_backoff_s"),
+    ):
+        value = mem.get(src)
+        if (
+            dst in supported_fields
+            and isinstance(value, int | float)
+            and not isinstance(value, bool)
+        ):
+            out[dst] = value
     extra_body = mem.get("extract_extra_body")
-    if "memory_aux_extra_body" in supported_fields and isinstance(extra_body, dict) and extra_body:
+    aux_model = mem.get("aux_model")
+    has_aux_override = isinstance(aux_model, str) and bool(aux_model.strip())
+    if (
+        "memory_aux_extra_body" in supported_fields
+        and isinstance(extra_body, dict)
+        and extra_body
+        and (not has_aux_override or "memory_aux_light_model" in out)
+    ):
         out["memory_aux_extra_body"] = dict(extra_body)
-    elif "memory_aux_thinking" in supported_fields and isinstance(extra_body, dict):
-        template = extra_body.get("chat_template_kwargs")
-        if isinstance(template, dict) and isinstance(template.get("enable_thinking"), bool):
-            out["memory_aux_thinking"] = "on" if template["enable_thinking"] else "off"
 
     # octop-harness 0.9.5 predates the interval trigger fields. Keep
     # hot reload working against that release and approximate interval mode
@@ -447,7 +487,6 @@ class AgentManager:
         from octop.config import OctopConfig as _OctopConfig  # noqa: PLC0415
 
         self._config = config or _OctopConfig()
-        self.device_manager: Any = None
         self._expert_catalog = expert_catalog
         self._plugin_manager = plugin_manager
         self._cron_manager: CronManager | None = None
@@ -465,8 +504,6 @@ class AgentManager:
         self._harness_manager: HarnessAgentManager | None = None
         self.memory_slim = MemorySlimCoordinator(self)
         self._lock = asyncio.Lock()
-        self._shared_instance_lock = asyncio.Lock()
-        self._isolated_backends: dict[str, Any] = {}
         # Serialize start/reload per agent so parallel provider reloads cannot
         # double-register the same harness id ("already exists in the registry").
         self._agent_lifecycle_locks: dict[str, asyncio.Lock] = {}
@@ -478,12 +515,24 @@ class AgentManager:
         self._active_invocations: dict[str, int] = {}
         self._invocation_waiters: dict[str, int] = {}
         self._history_backfills: dict[str, asyncio.Event] = {}
+        # Agents whose SQLite file should be rebuilt once they are idle.
+        self._reclaim_pending: set[str] = set()
+        self._reclaim_holds: dict[str, asyncio.Event] = {}
+        self._reclaim_task: asyncio.Task[None] | None = None
+        self._reclaim_wake: asyncio.Event | None = None
         self._reload_dirty: set[str] = set()
         self._reload_worker_running: dict[str, bool] = {}
         self._bootstrap_graph_refresh_pending: set[str] = set()
+        # Completion latch set by the bootstrap callback. Do not cache False:
+        # the middleware can complete between dashboard polls.
+        self._bootstrap_known: dict[str, bool] = {}
         # Chat user id used to resolve connectors when agent.user_id is NULL (shared agents).
         self._connector_user_override: dict[str, int] = {}
         self._langfuse = LangfuseSettingsStore(
+            settings_repo=repos.settings_repo,
+            secret_repo=repos.secret_repo,
+        )
+        self._decision = DecisionSettingsStore(
             settings_repo=repos.settings_repo,
             secret_repo=repos.secret_repo,
         )
@@ -496,10 +545,12 @@ class AgentManager:
             settings_repo=repos.settings_repo,
             agents_repo=repos.agent_repo,
         )
-        self._tool_guard_rules = ToolGuardRulesStore(paths=paths)
+        self._tool_guard_rules = ToolGuardRulesStore(paths=paths, settings=repos.settings_repo)
         self._providers = ProviderStore(
             provider_repo=repos.provider_repo,
         )
+        self._host_models = HostModelFactory()
+        self._model_health = ModelHealthRegistry()
         self._connector_svc = ConnectorService(
             repo=repos.connector_repo,
             secret_repo=repos.secret_repo,
@@ -521,6 +572,10 @@ class AgentManager:
             settings_repo=repos.settings_repo,
             secret_repo=repos.secret_repo,
         )
+        self._decision = DecisionSettingsStore(
+            settings_repo=repos.settings_repo,
+            secret_repo=repos.secret_repo,
+        )
         self._media_generation = MediaGenerationSettingsStore(
             settings_repo=repos.settings_repo,
             secret_repo=repos.secret_repo,
@@ -529,6 +584,9 @@ class AgentManager:
         self._acp_settings = ACPSettingsStore(
             settings_repo=repos.settings_repo,
             agents_repo=repos.agent_repo,
+        )
+        self._tool_guard_rules = ToolGuardRulesStore(
+            paths=self._paths, settings=repos.settings_repo
         )
         self._providers = ProviderStore(provider_repo=repos.provider_repo)
         self._connector_svc = ConnectorService(
@@ -567,8 +625,9 @@ class AgentManager:
             providers=providers,
             langfuse=self._langfuse.harness_config(),
             team_processor=self._team_processor,
-            log_dir=str(self.paths.logs_dir),
+            file_logging=False,
         )
+        self._host_models.sync(providers)
         if self._harness_manager is not None:
             self._harness_manager.team.bind_peer_enrich(self._refresh_peer_entry)
             proc = self._team_processor
@@ -578,6 +637,15 @@ class AgentManager:
                 if prepare is not None or after is not None:
                     self._harness_manager.team.bind_peer_session(prepare=prepare, after=after)
             self._install_team_host_dispatch()
+            from octop.infra.agents.teams.team_manager import (  # noqa: PLC0415
+                wire_shared_member_peers,
+            )
+
+            wire_shared_member_peers(
+                self._harness_manager.team,
+                load_agent=self.get_row,
+                load_user=self._repos.user_repo.get,
+            )
             self._harness_manager.set_security_policy(self._security.harness_policy())
 
         rows = self._repos.agent_repo.list_all(include_disabled=False)
@@ -610,6 +678,13 @@ class AgentManager:
                 )
 
     async def shutdown(self) -> None:
+        self._reclaim_pending.clear()
+        reclaim_task = self._reclaim_task
+        self._reclaim_task = None
+        if reclaim_task is not None and not reclaim_task.done():
+            reclaim_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await reclaim_task
         await self.memory_slim.close()
         async with self._lock:
             if self._harness_manager:
@@ -619,17 +694,7 @@ class AgentManager:
                 except Exception:
                     logger.exception("harness_manager.aclose() failed")
                 self._harness_manager = None
-            await asyncio.to_thread(self._release_isolated_backends)
-
-    def _release_isolated_backends(self, agent_id: str | None = None) -> None:
-        for key, backend in list(getattr(self, "_isolated_backends", {}).items()):
-            if agent_id is not None and json.loads(key)[0]["agent_id"] != agent_id:
-                continue
-            getattr(self, "_isolated_backends", {}).pop(key, None)
-            try:
-                backend.release()
-            except Exception:
-                logger.exception("failed to release isolated workspace handle")
+            self._host_models.close()
 
     # ------------------------------------------------------------------
     # Exposed stores & paths (read-only accessors)
@@ -638,6 +703,11 @@ class AgentManager:
     @property
     def providers(self) -> ProviderStore:
         return self._providers
+
+    @property
+    def host_models(self) -> HostModelFactory:
+        """One-shot model access outside an agent turn."""
+        return self._host_models
 
     @property
     def security(self) -> SecuritySettingsStore:
@@ -654,6 +724,10 @@ class AgentManager:
     @property
     def langfuse(self) -> LangfuseSettingsStore:
         return self._langfuse
+
+    @property
+    def decision(self) -> DecisionSettingsStore:
+        return self._decision
 
     @property
     def media_generation(self) -> MediaGenerationSettingsStore:
@@ -711,6 +785,7 @@ class AgentManager:
                 seed_workspace_dir_on_create,
             )
             from octop.infra.users.resource_policy import (
+                apply_workspace_root_to_config,
                 assert_agent_quota_available,
                 raise_if_backend_outside_user_root,
             )
@@ -723,19 +798,22 @@ class AgentManager:
                         self._repos.agent_repo,
                         spec.user_id,
                     )
+                apply_workspace_root_to_config(
+                    self._repos.user_policy_repo,
+                    spec.user_id,
+                    config,
+                    fill_missing=True,
+                )
                 raise_if_backend_outside_user_root(
                     self._repos.user_policy_repo,
                     spec.user_id,
                     config.get("backend"),
                 )
+                self._assert_named_storage_backends(spec.user_id, config.get("backend"))
+                self._assert_model_ref(spec.user_id, spec.default_model)
 
             # Create-time: user-assigned workspace_dir wins; otherwise default+encode.
             # After insert, resolve_workspace_dir reads the DB value as source of truth.
-            from octop.infra.backend.isolation import isolated_config, isolation_enabled
-
-            if isolation_enabled():
-                config = isolated_config(config)
-                config["workspace_dir"] = str(self._paths.agents_dir / agent_id)
             seed_workspace_dir_on_create(config, paths=self._paths, agent_id=agent_id)
             # ``system_files_path`` is an internal layout control and must not
             # be user-configurable. New agents always use the default prefix.
@@ -765,6 +843,15 @@ class AgentManager:
             else:
                 raw_mcp = profile.get("mcp_servers")
                 mcp_servers_json = raw_mcp if isinstance(raw_mcp, str) else None
+            if spec.user_id is not None:
+                self._assert_skill_packages_visible(
+                    spec.user_id,
+                    _stored_id_list(package_ids_json),
+                )
+                self.validate_knowledge_base_ids(
+                    spec.user_id,
+                    _stored_id_list(knowledge_ids_json),
+                )
             self._repos.agent_repo.create(
                 agent_id=agent_id,
                 user_id=spec.user_id,
@@ -864,11 +951,35 @@ class AgentManager:
         except Exception:
             logger.exception("abort team create: harness remove failed for %s", agent_id)
         try:
+            row = self._repos.agent_repo.get(agent_id)
             workspace_dir = self.resolve_workspace_dir(agent_id, persist_if_missing=False)
-            if await asyncio.to_thread(workspace_dir.exists):
+            if row is not None:
+                from octop.infra.agents.memory.thread_cleanup import (  # noqa: PLC0415
+                    agent_config_from_row,
+                    delete_agent_memory_and_checkpoints,
+                )
+
+                cfg = agent_config_from_row(row)
+                await asyncio.to_thread(
+                    delete_agent_memory_and_checkpoints,
+                    agent_id=agent_id,
+                    thread_ids=self._repos.thread_repo.list_ids_for_agent(agent_id),
+                    cfg=cfg,
+                    octop_config=self._config,
+                    workspace_dir=workspace_dir,
+                    paths=self._paths,
+                )
+                from octop.infra.agents.workspace.dir import remove_agent_host_dirs  # noqa: PLC0415
+
+                await asyncio.to_thread(
+                    remove_agent_host_dirs, cfg, paths=self._paths, agent_id=agent_id
+                )
+            elif await asyncio.to_thread(workspace_dir.exists):
                 await asyncio.to_thread(shutil.rmtree, workspace_dir)
         except OSError:
             logger.exception("abort team create: rmtree failed for %s", agent_id)
+        except Exception:
+            logger.exception("abort team create: memory purge failed for %s", agent_id)
         try:
             self._repos.agent_repo.delete(agent_id)
         except Exception:
@@ -933,10 +1044,34 @@ class AgentManager:
             )
             owner_row = self._repos.agent_repo.get(agent_id)
             if owner_row is not None and owner_row.user_id is not None:
-                from octop.infra.users.resource_policy import raise_if_backend_outside_user_root
+                from octop.infra.users.resource_policy import (
+                    POLICY_WORKSPACE_ROOT_DIR,
+                    apply_workspace_root_to_config,
+                    effective_workspace_root_dir,
+                    persisted_workspace_within_root,
+                    raise_if_backend_outside_user_root,
+                )
 
+                allowed_root = effective_workspace_root_dir(
+                    self._repos.user_policy_repo.get(owner_row.user_id, POLICY_WORKSPACE_ROOT_DIR)
+                )
+                workspace_in_jail = persisted_workspace_within_root(
+                    parsed_profile_cfg, allowed_root
+                )
+                if workspace_in_jail:
+                    apply_workspace_root_to_config(
+                        self._repos.user_policy_repo,
+                        owner_row.user_id,
+                        parsed_profile_cfg,
+                        fill_missing=False,
+                    )
                 raise_if_backend_outside_user_root(
                     self._repos.user_policy_repo,
+                    owner_row.user_id,
+                    parsed_profile_cfg.get("backend"),
+                    reject_host_root=bool(allowed_root) and not workspace_in_jail,
+                )
+                self._assert_named_storage_backends(
                     owner_row.user_id,
                     parsed_profile_cfg.get("backend"),
                 )
@@ -944,6 +1079,10 @@ class AgentManager:
             kwargs["config_json"] = dumps_config(parsed_profile_cfg)
             for key, value in lifted.items():
                 kwargs.setdefault(key, value)
+        if "default_model" in kwargs:
+            model_owner = self._repos.agent_repo.get(agent_id)
+            if model_owner is not None and model_owner.user_id is not None:
+                self._assert_model_ref(model_owner.user_id, kwargs.get("default_model"))
         new_name = kwargs.get("name")
         if isinstance(new_name, str):
             row = self._repos.agent_repo.get(agent_id)
@@ -989,14 +1128,24 @@ class AgentManager:
         return updated
 
     async def delete(self, agent_id: str) -> None:
-        """Remove agent from DB, harness runtime, and workspace directory."""
+        """Remove agent from DB, harness runtime, workspace, memory, and checkpoints.
+
+        Checkpoint rows and Postgres memory namespaces are not foreign keys
+        of ``agents``. They are deleted before the agent row. If that purge
+        fails, the row stays so the delete can be retried.
+        """
         row = self._repos.agent_repo.get(agent_id)
         if row is None:
             raise OctopError(ErrorCode.AGENT_NOT_FOUND, f"agent {agent_id!r} not found")
         self._teams.assert_can_delete_agent(agent_id)
+        from octop.infra.agents.memory.thread_cleanup import (  # noqa: PLC0415
+            agent_config_from_row,
+            delete_agent_memory_and_checkpoints,
+        )
         from octop.infra.agents.teams import is_team_agent
 
         affected_teams: list[str] = []
+        thread_ids = self._repos.thread_repo.list_ids_for_agent(agent_id)
         workspace_dir = self.resolve_workspace_dir(agent_id, persist_if_missing=False)
         async with self._lock:
             if not is_team_agent(row):
@@ -1006,14 +1155,30 @@ class AgentManager:
                     logger.exception("failed to drop deleted expert %s from team rosters", agent_id)
             await asyncio.to_thread(self._quiesce_octop_memory, agent_id)
             await self._harness_manager.aremove_agent(agent_id)  # type: ignore[union-attr]
-            await asyncio.to_thread(self._release_isolated_backends, agent_id)
+        self._bootstrap_known.pop(agent_id, None)
         self._plugin_tool_labels.pop(agent_id, None)
+        cfg = agent_config_from_row(row)
+        await asyncio.to_thread(
+            delete_agent_memory_and_checkpoints,
+            agent_id=agent_id,
+            thread_ids=thread_ids,
+            cfg=cfg,
+            octop_config=self._config,
+            workspace_dir=workspace_dir,
+            paths=self._paths,
+        )
         try:
-            if await asyncio.to_thread(workspace_dir.exists):
-                await asyncio.to_thread(shutil.rmtree, workspace_dir)
+            from octop.infra.agents.workspace.dir import remove_agent_host_dirs  # noqa: PLC0415
+
+            await asyncio.to_thread(
+                remove_agent_host_dirs, cfg, paths=self._paths, agent_id=agent_id
+            )
         except OSError:
             logger.exception("rmtree failed for %s; agent removed from DB anyway", workspace_dir)
         self._repos.agent_repo.delete(agent_id)
+        from octop.infra.users.groups import RESOURCE_EXPERT, GroupAccess  # noqa: PLC0415
+
+        GroupAccess(self._repos).clear(RESOURCE_EXPERT, agent_id)
         if self._proactive_scheduler is not None:
             self._proactive_scheduler.cancel(agent_id)
         self._repos.audit_repo.write(actor=ACTOR_SYSTEM, action="agent.delete", target=agent_id)
@@ -1067,6 +1232,7 @@ class AgentManager:
             async with self._lifecycle_lock_for(agent_id):
                 await asyncio.to_thread(self._quiesce_octop_memory, agent_id)
                 await self._harness_manager.aremove_agent(agent_id)  # type: ignore[union-attr]
+                self._bootstrap_known.pop(agent_id, None)
                 self._repos.agent_repo.set_state(agent_id, "stopped", error=None)
 
     def _quiesce_octop_memory(self, agent_id: str) -> None:
@@ -1093,6 +1259,79 @@ class AgentManager:
             with suppress(Exception):
                 shutdown()
         self._wait_memory_maintenance_idle(mw)
+
+    async def restore_memory_store(
+        self, agent_id: str, memory: Any, operation: Callable[[], dict[str, Any]], *, locale: str
+    ) -> dict[str, Any]:
+        """Drain and recreate only this expert; caller owns its turn reservation."""
+        from octop_harness.memory.store import shared_memory_store
+
+        from octop.i18n import tr
+
+        assert self._harness_manager is not None
+        async with self._lifecycle_lock_for(agent_id):
+            agent = self.get_agent(agent_id)
+            runtime = agent._memory_runtime
+            if runtime.memory is not memory:
+                raise ValueError(tr("memory_storage.restore_changed", locale))
+            key = runtime._memory_key
+            if key is not None and shared_memory_store().refs(key) != 1:
+                raise ValueError(tr("memory_storage.shared_sqlite", locale))
+            mw = runtime._middleware
+            pause_background = getattr(mw, "pause_background", None)
+            if not callable(pause_background):
+                raise ValueError(tr("memory_storage.incompatible", locale))
+            pause = pause_background(timeout=120)
+            draining = asyncio.create_task(asyncio.to_thread(pause.__enter__))
+            try:
+                await asyncio.shield(draining)
+            except asyncio.CancelledError:
+                await draining
+                await asyncio.to_thread(pause.__exit__, None, None, None)
+                raise
+            removed = False
+            try:
+                row = self.get_row(agent_id)
+                if row is None:
+                    raise ValueError(tr("memory_storage.restore_changed", locale))
+                cfg, metadata, tags, user_display = self._agent_runtime_bundle(row)
+                removed = True
+                await self._harness_manager.aremove_agent(agent_id)
+                if runtime.memory is not None or (
+                    key is not None and shared_memory_store().peek(key) is not None
+                ):
+                    raise ValueError(tr("memory_storage.restore_changed", locale))
+                worker = asyncio.create_task(asyncio.to_thread(operation))
+                try:
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    await worker
+                    raise
+            finally:
+                try:
+                    if removed:
+                        try:
+                            assert row is not None
+                            entry = await self._harness_manager.acreate_agent(
+                                cfg,
+                                agent_id=agent_id,
+                                metadata=metadata,
+                                tags=tags,
+                                init_workspace=False,
+                            )
+                            await self._post_start_agent(
+                                row, entry.agent, cfg, user_display=user_display
+                            )
+                            self._repos.agent_repo.set_state(agent_id, "running", error=None)
+                        except Exception as exc:
+                            self._repos.agent_repo.set_state(
+                                agent_id, "failed", error=format_agent_start_error(exc)
+                            )
+                            raise ValueError(
+                                tr("memory_storage.restore_reload_failed", locale)
+                            ) from exc
+                finally:
+                    await asyncio.to_thread(pause.__exit__, None, None, None)
 
     @staticmethod
     def _wait_memory_maintenance_idle(mw: object, *, timeout: float = 5.0) -> None:
@@ -1136,6 +1375,84 @@ class AgentManager:
             except KeyError:
                 pass
         return self._backend_workspace_for_row(row)
+
+    async def save_manual_memory_document(self, agent_id: str, filename: str, content: str) -> None:
+        """Serialize owner edits with document review and lifecycle changes."""
+        if filename not in {"USER.md", "MEMORY.md"}:
+            raise ValueError("Unsupported manual memory document")
+        async with self._lifecycle_lock_for(agent_id):
+            workspace = await asyncio.to_thread(self.workspace_for_agent, agent_id)
+            if workspace is None:
+                raise self._unavailable_error(agent_id)
+            await workspace.awrite_text(filename, content, force=True)
+
+    async def review_manual_memory_documents(self, agent_id: str) -> dict[str, Any]:
+        """Review current files, including for stopped agents, without changing session snapshots."""
+        async with self._lifecycle_lock_for(agent_id):
+            if self.memory_slim.busy and self.memory_slim.status(agent_id) is not None:
+                raise OctopError.localized(ErrorCode.AGENT_BUSY)
+            workspace = await asyncio.to_thread(self.workspace_for_agent, agent_id)
+            if workspace is None:
+                raise self._unavailable_error(agent_id)
+            documents = {}
+            for filename in ("USER.md", "MEMORY.md"):
+                data = await workspace.adownload_bytes(filename)
+                documents[filename] = data.decode("utf-8") if data is not None else ""
+
+            def run() -> dict[str, Any]:
+                from octop_harness.llm.factory import ChatModelFactory
+                from octop_harness.memory.runtime import MemoryRuntime
+
+                temporary = None
+                owned_factory = None
+                try:
+                    try:
+                        service = self.get_agent(agent_id)._memory_runtime.service
+                    except OctopError:
+                        row = self.get_row(agent_id)
+                        if row is None:
+                            raise self._unavailable_error(agent_id) from None
+                        cfg = self._build_harness_config(row)
+                        if not cfg.memory_enabled:
+                            return {"status": "disabled"}
+                        factory = (
+                            self._harness_manager.shared_factory
+                            if self._harness_manager is not None
+                            else None
+                        )
+                        if factory is None:
+                            factory = owned_factory = ChatModelFactory(
+                                cfg.providers, agent_config=cfg
+                            )
+                        temporary = MemoryRuntime(
+                            config=cfg,
+                            workspace_path=Path(cfg.workspace_dir),
+                            model_factory=factory,
+                            workspace=workspace,
+                        )
+                        service = temporary.service
+                    if service is None:
+                        return {"status": "disabled"}
+
+                    def current() -> bool:
+                        return all(
+                            (workspace.download_bytes(name) or b"").decode("utf-8") == body
+                            for name, body in documents.items()
+                        )
+
+                    return dict(service.reconcile_manual_documents(documents, is_current=current))
+                finally:
+                    if temporary is not None:
+                        temporary.close()
+                    if owned_factory is not None:
+                        owned_factory.close()
+
+            worker = asyncio.create_task(asyncio.to_thread(run))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                await worker
+                raise
 
     def list_agents(self, user_id: int) -> list[AgentRow]:
         return self._repos.agent_repo.list_by_user(user_id, include_disabled=False)
@@ -1198,14 +1515,8 @@ class AgentManager:
             resolve_workspace_host_path,
             workspace_dir_from_config,
         )
-        from octop.infra.backend.isolation import isolated_spec, isolation_enabled
 
         cfg = self.get_config(agent_id)
-        if isolation_enabled():
-            expected = self._paths.agents_dir / agent_id
-            isolated_spec(self._paths, agent_id, expected)
-            expected.mkdir(parents=True, exist_ok=True)
-            return expected
         raw = cfg.get("workspace_dir")
         if isinstance(raw, str) and raw.strip():
             out = workspace_dir_from_config(cfg, paths=self._paths, agent_id=agent_id)
@@ -1242,7 +1553,13 @@ class AgentManager:
         if is_team_agent(self.get_row(agent_id)):
             return True
         try:
-            return self.get_agent(agent_id).is_bootstrapped()
+            agent = self.get_agent(agent_id)
+        except OctopError:
+            return False
+        if self._bootstrap_known.get(agent_id) is True:
+            return True
+        try:
+            known = agent.is_bootstrapped()
         except OctopError:
             return False
         except Exception:
@@ -1252,6 +1569,9 @@ class AgentManager:
                 exc_info=True,
             )
             return True
+        if known:
+            self._bootstrap_known[agent_id] = True
+        return known
 
     def find_agents_using_provider(self, provider_name: str) -> list[dict[str, str]]:
         """Return agents referencing *provider_name* in config or default_model."""
@@ -1300,36 +1620,261 @@ class AgentManager:
             return OctopError(ErrorCode.AGENT_FAILED, f"agent {agent_id!r} failed to start")
         return OctopError(ErrorCode.AGENT_NOT_RUNNING, f"agent {agent_id!r} not running")
 
-    async def delete_thread_checkpoint(self, agent_id: str, thread_id: str) -> bool:
-        """Best-effort delete of a thread's actual conversation data.
+    def assert_agents_deletable(self, agent_ids: Sequence[str]) -> None:
+        """Raise when any owned agent has an in-flight team job."""
+        for agent_id in agent_ids:
+            self._teams.assert_can_delete_agent(agent_id)
 
-        Octop's own ``thread_registry`` only tracks UI metadata (title,
-        pinned, last_active) — the real message content lives in the
-        agent's LangGraph checkpointer. Deleting only the registry row
-        makes "delete conversation" cosmetic: the content stays in the
-        checkpoint store forever. Callers should call this *before*
-        removing their own thread row, so a checkpoint-delete failure
-        leaves the thread visible/retryable instead of orphaning data
-        with no remaining handle to it.
+    async def delete_thread_checkpoint(
+        self, agent_id: str, thread_id: str, *, reclaim: bool = True
+    ) -> None:
+        """Delete a thread's conversation data from the checkpoint store.
 
-        Returns ``True`` when checkpoint data was actually deleted,
-        ``False`` when there was nothing to delete (agent not currently
-        running, or no checkpointer configured for it) — both are normal,
-        expected states, not errors.
+        Uses the live harness checkpointer when the agent is loaded.
+        Otherwise opens the configured SQLite or Postgres memory store
+        directly, so a restart does not skip the delete. Raises
+        ``CHECKPOINT_DELETE_FAILED`` when persisted data could not be
+        removed. Returns normally when the store has nothing for this
+        thread. Callers should invoke this *before* removing their own
+        thread row, so a failure leaves the thread visible and retryable.
+
+        ``reclaim=False`` skips the incremental SQLite vacuum. Delete-only
+        uses that so the request itself does not vacuum.
         """
+        row = self.get_row(agent_id)
+        harness = None
         try:
             harness = self.get_agent(agent_id)
-        except OctopError:
-            logger.warning(
-                "delete_thread_checkpoint: agent %r not running; skipping checkpoint cleanup for thread %r",
-                agent_id,
-                thread_id,
+        except OctopError as exc:
+            if exc.code == ErrorCode.AGENT_NOT_FOUND or row is None:
+                raise
+            harness = None
+        live_error: Exception | None = None
+        if harness is not None:
+            adelete = getattr(harness, "adelete_thread", None)
+            if adelete is not None:
+                try:
+                    await adelete(thread_id)
+                except OctopError:
+                    raise
+                except Exception as exc:
+                    live_error = exc
+        if row is None:
+            if live_error is not None:
+                raise OctopError(
+                    ErrorCode.CHECKPOINT_DELETE_FAILED,
+                    f"could not delete conversation data for thread {thread_id!r}",
+                ) from live_error
+            return
+        try:
+            await asyncio.to_thread(
+                self._delete_thread_from_store, agent_id, thread_id, row, reclaim
             )
+        except OctopError:
+            if live_error is not None:
+                raise OctopError(
+                    ErrorCode.CHECKPOINT_DELETE_FAILED,
+                    f"could not delete conversation data for thread {thread_id!r}",
+                ) from live_error
+            raise
+
+    def _delete_thread_from_store(
+        self, agent_id: str, thread_id: str, row: Any, reclaim: bool = True
+    ) -> None:
+        from octop.infra.agents.memory.thread_cleanup import (  # noqa: PLC0415
+            delete_thread_from_agent_stores,
+            workspace_for_agent_row,
+        )
+
+        cfg = self._agent_config_dict(row)
+        workspace = workspace_for_agent_row(row, paths=self._paths)
+        delete_thread_from_agent_stores(
+            agent_id=agent_id,
+            thread_id=thread_id,
+            cfg=cfg,
+            octop_config=self._config,
+            workspace_dir=workspace,
+            paths=self._paths,
+            reclaim=reclaim,
+        )
+
+    def _reclaim_thread_store(self, agent_id: str, thread_id: str, row: Any) -> None:
+        if row is None:
+            return
+        from octop.infra.agents.memory.thread_cleanup import (  # noqa: PLC0415
+            reclaim_stored_thread,
+            workspace_for_agent_row,
+        )
+
+        reclaim_stored_thread(
+            agent_id=agent_id,
+            thread_id=thread_id,
+            cfg=self._agent_config_dict(row),
+            octop_config=self._config,
+            workspace_dir=workspace_for_agent_row(row, paths=self._paths),
+        )
+
+    def schedule_store_reclaim(self, agent_id: str) -> None:
+        """Shrink this agent's database after it is idle.
+
+        Used when compact-now could not run, and when the idle sweep finds
+        a large freelist. Delete-only does not call this.
+        """
+        self._reclaim_pending.add(agent_id)
+        self._ensure_reclaim_task()
+
+    def schedule_idle_reclaim_sweep(self) -> None:
+        """Queue loaded stores whose freelist is already large enough to compact."""
+        try:
+            asyncio.get_running_loop().create_task(
+                self._sweep_bloated_stores(), name="store-reclaim-sweep"
+            )
+        except RuntimeError:
+            return
+
+    async def compact_agent_database(self, agent_id: str, *, wait_s: float = 60) -> bool:
+        """Rebuild the database now. False means it was deferred until idle."""
+        deadline = time.monotonic() + wait_s
+        while True:
+            if self._try_acquire_reclaim(agent_id):
+                try:
+                    done = await asyncio.to_thread(self._compact_agent_database_sync, agent_id)
+                finally:
+                    self._release_reclaim(agent_id)
+                if done:
+                    self._reclaim_pending.discard(agent_id)
+                    return True
+                self.schedule_store_reclaim(agent_id)
+                return False
+            if time.monotonic() >= deadline:
+                self.schedule_store_reclaim(agent_id)
+                return False
+            await asyncio.sleep(0.25)
+
+    def _try_acquire_reclaim(self, agent_id: str) -> bool:
+        if (
+            self.is_agent_active(agent_id)
+            or self._invocation_waiters.get(agent_id, 0) > 0
+            or agent_id in self._reclaim_holds
+            or agent_id in self._history_backfills
+        ):
             return False
-        adelete = getattr(harness, "adelete_thread", None)
-        if adelete is None:
+        self._reclaim_holds[agent_id] = asyncio.Event()
+        if self.is_agent_active(agent_id) or self._invocation_waiters.get(agent_id, 0) > 0:
+            self._release_reclaim(agent_id)
             return False
-        return bool(await adelete(thread_id))
+        return True
+
+    def _release_reclaim(self, agent_id: str) -> None:
+        event = self._reclaim_holds.pop(agent_id, None)
+        if event is not None:
+            event.set()
+
+    def _ensure_reclaim_task(self) -> None:
+        if self._reclaim_wake is None:
+            self._reclaim_wake = asyncio.Event()
+        self._reclaim_wake.set()
+        task = self._reclaim_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._reclaim_task = loop.create_task(self._reclaim_pending_loop(), name="store-reclaim")
+
+    async def _sweep_bloated_stores(self) -> None:
+        queued = await asyncio.to_thread(self._queue_bloated_sqlite_stores)
+        if queued:
+            self._ensure_reclaim_task()
+
+    def _queue_bloated_sqlite_stores(self) -> int:
+        from octop.infra.agents.memory.thread_cleanup import (  # noqa: PLC0415
+            RECLAIM_MIN_FREELIST_BYTES,
+            agent_config_from_row,
+            agent_sqlite_freelist_bytes,
+            workspace_for_agent_row,
+        )
+
+        queued = 0
+        for row in self._repos.agent_repo.list_all(include_disabled=True):
+            try:
+                nbytes = agent_sqlite_freelist_bytes(
+                    agent_id=row.agent_id,
+                    cfg=agent_config_from_row(row),
+                    octop_config=self._config,
+                    workspace_dir=workspace_for_agent_row(row, paths=self._paths),
+                    paths=self._paths,
+                )
+            except Exception:
+                logger.warning("freelist scan failed agent=%s", row.agent_id, exc_info=True)
+                continue
+            if nbytes < RECLAIM_MIN_FREELIST_BYTES:
+                continue
+            self._reclaim_pending.add(row.agent_id)
+            queued += 1
+        return queued
+
+    async def _reclaim_pending_loop(self) -> None:
+        try:
+            while self._reclaim_pending:
+                finished_one = False
+                for agent_id in list(self._reclaim_pending):
+                    if not self._try_acquire_reclaim(agent_id):
+                        continue
+                    try:
+                        done = await asyncio.to_thread(self._compact_agent_database_sync, agent_id)
+                    except Exception:
+                        logger.warning("idle compact failed agent=%s", agent_id, exc_info=True)
+                        done = False
+                    finally:
+                        self._release_reclaim(agent_id)
+                    if done:
+                        self._reclaim_pending.discard(agent_id)
+                        finished_one = True
+                if not self._reclaim_pending:
+                    break
+                if finished_one:
+                    continue
+                wake = self._reclaim_wake
+                if wake is None:
+                    await asyncio.sleep(30)
+                    continue
+                wake.clear()
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=30)
+                except TimeoutError:
+                    continue
+        finally:
+            current = asyncio.current_task()
+            if self._reclaim_task is current:
+                self._reclaim_task = None
+            if self._reclaim_pending and (self._reclaim_task is None or self._reclaim_task.done()):
+                self._ensure_reclaim_task()
+
+    def _compact_agent_database_sync(self, agent_id: str) -> bool:
+        from octop.infra.agents.memory.thread_cleanup import (  # noqa: PLC0415
+            agent_config_from_row,
+            compact_agent_store_file,
+            compact_live_sqlite,
+            workspace_for_agent_row,
+        )
+
+        row = self.get_row(agent_id)
+        if row is None:
+            return True
+        harness = self._octop_harness_or_none(agent_id)
+        if harness is not None:
+            memory = getattr(getattr(harness, "_memory_runtime", None), "memory", None)
+            if memory is None:
+                return True
+            return compact_live_sqlite(memory)
+        return compact_agent_store_file(
+            agent_id=agent_id,
+            cfg=agent_config_from_row(row),
+            octop_config=self._config,
+            workspace_dir=workspace_for_agent_row(row, paths=self._paths),
+        )
 
     # ------------------------------------------------------------------
     # Chat / invoke — stream, call, HITL, thread model overrides
@@ -1359,7 +1904,10 @@ class AgentManager:
     async def _begin_invocation(self, agent_id: str) -> None:
         self._invocation_waiters[agent_id] = self._invocation_waiters.get(agent_id, 0) + 1
         try:
-            while event := self._history_backfills.get(agent_id):
+            while True:
+                event = self._history_backfills.get(agent_id) or self._reclaim_holds.get(agent_id)
+                if event is None:
+                    break
                 await event.wait()
         finally:
             waiting = self._invocation_waiters.get(agent_id, 1) - 1
@@ -1375,6 +1923,8 @@ class AgentManager:
             self._active_invocations[agent_id] = active
         else:
             self._active_invocations.pop(agent_id, None)
+            if agent_id in self._reclaim_pending:
+                self._ensure_reclaim_task()
 
     @asynccontextmanager
     async def _track_invocation(self, agent_id: str) -> AsyncIterator[None]:
@@ -1396,29 +1946,11 @@ class AgentManager:
         ):
             self._apply_pending_bootstrap_graph_refresh(agent_id)
             req = self._prepare_stream_request(agent_id, request)
-            device_manager = getattr(self, "device_manager", None)
-            if device_manager is not None:
-                device_manager.paused.pop((agent_id, thread_id), None)
             with (
                 hitl_thread_scope(thread_id_from_request(req)),
                 turn_model_scope(self._stream_model_label(agent_id, req, thread_id)),
             ):
                 async for chunk in self._harness_manager.stream(agent_id, cast(Any, req)):
-                    if (
-                        device_manager is not None
-                        and isinstance(chunk, dict)
-                        and chunk.get("type") == "hitl_required"
-                    ):
-                        from octop.infra.devices.tasks import CONFIG_KEY
-
-                        context = dict(req.get("configurable") or {})
-                        if context.get(CONFIG_KEY):
-                            device_manager.paused[(agent_id, thread_id)] = {
-                                **context,
-                                "user": req.get("user"),
-                                "agent_id": agent_id,
-                                "thread_id": thread_id,
-                            }
                     yield chunk
             self._apply_pending_bootstrap_graph_refresh(agent_id)
 
@@ -1447,8 +1979,6 @@ class AgentManager:
         decisions: list[dict[str, Any]],
     ) -> AsyncIterator[Any]:
         """Resume a paused HITL interrupt for *thread_id*."""
-        from octop.infra.devices.tasks import resumed_device_task
-
         if self._harness_manager is None:
             raise self._unavailable_error(agent_id)
         async with (
@@ -1458,11 +1988,6 @@ class AgentManager:
             self._apply_pending_bootstrap_graph_refresh(agent_id)
             with (
                 hitl_thread_scope(thread_id),
-                resumed_device_task(
-                    self.device_manager.paused.get((agent_id, thread_id))
-                    if getattr(self, "device_manager", None) is not None
-                    else None
-                ),
                 turn_model_scope(self._stream_model_label(agent_id, {}, thread_id)),
             ):
                 async for chunk in self._harness_manager.resume_hitl(
@@ -1489,14 +2014,28 @@ class AgentManager:
         if self._harness_manager is not None:
             self._harness_manager.clear_thread_model(agent_id, thread_id)
 
-    def resolve_fallback_model_ref(self) -> str | None:
-        """Settings active model when usable, else the first enabled catalog model."""
+    def _resolve_configured_fallback_model_ref(self) -> str | None:
+        """Return the configured fallback without applying runtime health."""
         name, model_id = self._repos.settings_repo.get_active_model()
         if name and model_id:
             ref = f"{name}/{model_id}"
             if self._providers.is_model_ref_usable(ref):
                 return ref
         return self._providers.resolve_first_model_ref()
+
+    def resolve_fallback_model_ref(self) -> str | None:
+        """Return the first healthy model for an automatic route."""
+        configured = self._resolve_configured_fallback_model_ref()
+        if configured and self._model_health.is_routable(configured):
+            return configured
+        for candidate in self._providers.list_auto_route_candidates(needs_multimodal=False):
+            if self._model_health.is_routable(candidate.ref):
+                return candidate.ref
+        return None
+
+    def is_auto_route_model_available(self, ref: str) -> bool:
+        """Return whether a usable model can start an automatic route now."""
+        return self._providers.is_model_ref_usable(ref) and self._model_health.is_routable(ref)
 
     # ------------------------------------------------------------------
     # Hot-reload — rebuild harness agents after config / provider changes
@@ -1531,25 +2070,26 @@ class AgentManager:
         provider_name: str | None = None,
         active_model_changed: bool = False,
     ) -> list[str]:
-        """Agent IDs that must be rebuilt after a provider / active-model change."""
+        """Agent IDs that must be rebuilt after a provider / active-model change.
+
+        AUTO agents bake a resolved fallback model ref into their harness config
+        at build time (active model first, else first usable) and that ref is
+        invisible to the DB config scan, so a provider change can strand it
+        (#2388). An AUTO agent is rebuilt when the active model changed or,
+        for a named provider change, when its baked ref points at that provider
+        or no longer matches what a build would resolve now. Explicit refs to
+        other providers are left alone.
+        """
         rows = self._repos.agent_repo.list_all(include_disabled=False)
         if provider_name is None and not active_model_changed:
             return [row.agent_id for row in rows]
 
         enabled_ids = {row.agent_id for row in rows}
+        auto_ids = {row.agent_id for row in rows if self._agent_uses_auto_default(row)}
         impact: set[str] = set()
-        include_auto = active_model_changed
-        if provider_name and not include_auto:
-            active_name, active_model = self._repos.settings_repo.get_active_model()
-            # Without a usable global pin, AUTO follows the enabled catalog.
-            # Any provider edit can replace that fallback, including disabling it.
-            include_auto = active_name == provider_name or not self._providers.is_model_ref_usable(
-                f"{active_name}/{active_model}"
-            )
-
         for row in rows:
             if row.last_state in _AGENT_STATES_NEEDING_MODEL_RELOAD or (
-                include_auto and self._agent_uses_auto_default(row)
+                active_model_changed and row.agent_id in auto_ids
             ):
                 impact.add(row.agent_id)
 
@@ -1558,8 +2098,48 @@ class AgentManager:
                 aid = ref.get("agent_id")
                 if isinstance(aid, str) and aid in enabled_ids:
                     impact.add(aid)
+            impact.update(
+                self._stale_auto_default_ids(
+                    provider_name=provider_name,
+                    enabled_ids=enabled_ids,
+                    auto_ids=auto_ids,
+                )
+            )
 
         return sorted(impact)
+
+    def _stale_auto_default_ids(
+        self,
+        *,
+        provider_name: str,
+        enabled_ids: set[str],
+        auto_ids: set[str],
+    ) -> set[str]:
+        """AUTO agents whose baked fallback ref went stale after a provider change.
+
+        The DB config only shows AUTO, so read the built harness configs:
+        rebuild when the baked ref points at the changed provider or differs
+        from what a build would resolve now. An agent built while no model was
+        usable has no baked ref at all, so it is rebuilt as soon as a fallback
+        exists — otherwise it would keep running without a model until restart.
+        """
+        if self._harness_manager is None or not auto_ids:
+            return set()
+        new_fallback = self._resolve_configured_fallback_model_ref()
+        prefix = f"{provider_name}/"
+        stale: set[str] = set()
+        for entry in self._harness_manager.list_agents():
+            aid = getattr(entry, "agent_id", None)
+            if not isinstance(aid, str) or aid not in auto_ids:
+                continue
+            built = getattr(getattr(entry, "config", None), "default_model", None)
+            if not isinstance(built, str) or not built:
+                if new_fallback is not None:
+                    stale.add(aid)
+                continue
+            if built.startswith(prefix) or (new_fallback is not None and built != new_fallback):
+                stale.add(aid)
+        return stale & enabled_ids
 
     async def _reload_agents(self, agent_ids: list[str]) -> None:
         """Reload agents concurrently with a fixed concurrency cap."""
@@ -1591,6 +2171,7 @@ class AgentManager:
         if self._harness_manager is None:
             return
         providers = self._providers.build_harness_configs()
+        self._host_models.sync(providers)
         sync_providers_to_harness(
             self._harness_manager,
             providers,
@@ -1710,16 +2291,11 @@ class AgentManager:
         """Load custom MCP tools once per user/server/fingerprint; share across agents."""
         from octop_harness.mcp import aload_mcp_tools
 
-        from octop.infra.backend.isolation import host_mcp, isolation_enabled
         from octop.infra.connectors.mcp_tool_cache import (
             fingerprint_mcp_spec,
             wrap_tools_for_shared_use,
         )
 
-        if isolation_enabled() and host_mcp(spec):
-            raise OctopError(
-                ErrorCode.FORBIDDEN, "host stdio connectors are disabled for isolated agents"
-            )
         fp = fingerprint_mcp_spec(spec)
         cache_key = (user_id, server_name, fp)
         cached = self._mcp_tool_cache.get(cache_key)
@@ -2001,6 +2577,8 @@ class AgentManager:
         in-process injection at the end of ``_post_start_agent``.
         """
         repo = self._repos.connector_repo
+        if not repo.connector_feature_allows(user_id):
+            return
         for inst in repo.list_visible(user_id):
             if inst.status != "active" or inst.mcp_server_name not in server_names:
                 continue
@@ -2052,6 +2630,53 @@ class AgentManager:
         if self._harness_manager is not None:
             self._harness_manager.set_langfuse(self._langfuse.harness_config())
         return view
+
+    async def save_decision(
+        self,
+        *,
+        enabled: bool,
+        provider: str,
+        endpoint: str,
+        model: str,
+        skills: bool,
+        tools: bool,
+        team: bool,
+        threshold: float,
+        tool_min_count: int,
+        api_key: str | None = None,
+        services: list[dict[str, object]] | None = None,
+    ) -> DecisionSettings:
+        """Persist the decision switch and rebuild agents so the middleware mounts or not."""
+        view = self._decision.save(
+            enabled=enabled,
+            provider=provider,
+            endpoint=endpoint,
+            model=model,
+            skills=skills,
+            tools=tools,
+            team=team,
+            threshold=threshold,
+            tool_min_count=tool_min_count,
+            api_key=api_key,
+            services=services,
+        )
+        await self.reload_all()
+        return view
+
+    async def probe_decision(
+        self,
+        *,
+        endpoint: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._decision.probe(
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            provider=provider,
+        )
 
     async def save_media_generation(
         self,
@@ -2116,11 +2741,6 @@ class AgentManager:
         self._schedule_reload(agent_id)
         return row
 
-    async def instantiate_shared(self, source_id: str, user_id: int) -> AgentRow:
-        from octop.infra.agents.experts.private_instance import instantiate_shared
-
-        return cast("AgentRow", await instantiate_shared(self, source_id, user_id))
-
     async def update_config_json(self, agent_id: str, config_json: str) -> AgentRow:
         """Patch ``config_json`` and reload the harness runtime in the background."""
         parsed = self._preserve_internal_layout(
@@ -2170,15 +2790,24 @@ class AgentManager:
         self.persist_harness_config(agent_id, cfg)
         self.sync_effective_tools_disabled(agent_id)
 
-    def _resolve_skill_package_dirs(self, agent_id: str) -> list[str]:
-        """Resolve persisted package ids to existing absolute package skill directories."""
-        store = SkillPackageStore(
+    def _skill_package_store(self) -> SkillPackageStore:
+        return SkillPackageStore(
             repo=self._repos.skill_package_repo,
             root=self._paths.skill_packages_dir,
+            database=self._config.database,
         )
+
+    def _resolve_skill_package_dirs(self, agent_id: str) -> list[str]:
+        """Resolve persisted package ids to existing absolute package skill directories."""
+        store = self._skill_package_store()
+        row = self._repos.agent_repo.get(agent_id)
+        owner_id = row.user_id if row is not None else None
         roots: list[str] = []
         for package_id in skill_package_ids_list(self.get_config(agent_id)):
-            if self._repos.skill_package_repo.get(package_id) is None:
+            package = self._repos.skill_package_repo.get(package_id)
+            if package is None:
+                continue
+            if owner_id is not None and not self._skill_package_visible(owner_id, package):
                 continue
             roots.append(str(store.package_skills_dir(package_id).resolve()))
         return roots
@@ -2212,8 +2841,6 @@ class AgentManager:
         if not isinstance(spec, dict):
             return False
         kind = str(spec.get("type") or "").lower()
-        if spec.get("_octop_isolated"):
-            return True
         if kind not in {"local_shell", "filesystem"}:
             return False
         root_dir = str(spec.get("root_dir") or "").strip()
@@ -2269,6 +2896,8 @@ class AgentManager:
         if row is None:
             raise OctopError(ErrorCode.AGENT_NOT_FOUND, f"agent {agent_id!r} not found")
         normalized_ids = self.validate_skill_package_ids(package_ids)
+        if row.user_id is not None:
+            self._assert_skill_packages_visible(row.user_id, normalized_ids)
         workspace_dir = self.resolve_workspace_dir(agent_id)
         if normalized_ids and not self._backend_supports_host_skill_packages(
             self._backend_spec_for_row(row),
@@ -2285,12 +2914,7 @@ class AgentManager:
             skill_package_ids=dump_id_list(normalized_ids),
             config_json=dumps_config(cfg),
         )
-        from octop.infra.backend.isolation import isolation_enabled
-
-        if isolation_enabled():
-            self._schedule_reload(agent_id)
-        else:
-            self.sync_skill_package_dirs(agent_id)
+        self.sync_skill_package_dirs(agent_id)
 
     def sync_skill_package_dirs(self, agent_id: str) -> None:
         """Hot-update ``skills_dir`` on the running harness agent (no rebuild)."""
@@ -2334,6 +2958,94 @@ class AgentManager:
                     f"skill package {package_id!r} not found",
                 )
         return normalized_ids
+
+    def _user_is_admin(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+        user = self._repos.user_repo.get(user_id)
+        return user is not None and user.role == "admin"
+
+    def model_ref_allowed_for_user(self, user_id: int, model_ref: str | None) -> bool:
+        from octop.infra.users.groups import model_ref_allowed
+
+        return model_ref_allowed(
+            self._repos,
+            user_id=user_id,
+            is_admin=self._user_is_admin(user_id),
+            model_ref=model_ref,
+        )
+
+    def _assert_model_ref(self, user_id: int, model_ref: str | None) -> None:
+        from octop.infra.users.groups import RESOURCE_MODEL, GroupAccess
+
+        ref = (model_ref or "").strip()
+        if not ref or ref.lower() == "auto" or "/" not in ref:
+            return
+        GroupAccess(self._repos).assert_allowed(
+            user_id=user_id,
+            is_admin=self._user_is_admin(user_id),
+            resource_type=RESOURCE_MODEL,
+            resource_key=ref,
+            is_owner=False,
+        )
+
+    def _assert_named_storage_backends(self, user_id: int, backend: Any) -> None:
+        from octop.infra.backend.resolver import collect_named_storage_backend_refs
+        from octop.infra.users.groups import RESOURCE_STORAGE_BACKEND, GroupAccess
+
+        refs = collect_named_storage_backend_refs(backend)
+        if not refs:
+            return
+        access = GroupAccess(self._repos)
+        is_admin = self._user_is_admin(user_id)
+        for name in refs:
+            access.assert_allowed(
+                user_id=user_id,
+                is_admin=is_admin,
+                resource_type=RESOURCE_STORAGE_BACKEND,
+                resource_key=str(name),
+                is_owner=False,
+            )
+
+    def _skill_package_shared_with(self, user_id: int, package: Any) -> bool:
+        """Private packages stay with the owner. Groups cannot open them."""
+        if self._user_is_admin(user_id):
+            return True
+        if str(user_id) == str(getattr(package, "created_by", "")):
+            return True
+        return bool(getattr(package, "shared", False))
+
+    def _skill_package_visible(self, user_id: int, package: Any) -> bool:
+        from octop.infra.users.groups import RESOURCE_SKILL_PACKAGE, GroupAccess
+
+        if not self._skill_package_shared_with(user_id, package):
+            return False
+        return GroupAccess(self._repos).allows(
+            user_id=user_id,
+            is_admin=self._user_is_admin(user_id),
+            resource_type=RESOURCE_SKILL_PACKAGE,
+            resource_key=str(package.id),
+            is_owner=str(user_id) == str(package.created_by),
+        )
+
+    def _assert_skill_packages_visible(self, user_id: int, package_ids: list[str]) -> None:
+        from octop.infra.users.groups import RESOURCE_SKILL_PACKAGE, GroupAccess
+
+        access = GroupAccess(self._repos)
+        is_admin = self._user_is_admin(user_id)
+        for package_id in package_ids:
+            package = self._repos.skill_package_repo.get(package_id)
+            if package is None:
+                continue
+            if not self._skill_package_shared_with(user_id, package):
+                raise OctopError(ErrorCode.SKILL_PACKAGE_NOT_FOUND, "skill package not found")
+            access.assert_allowed(
+                user_id=user_id,
+                is_admin=is_admin,
+                resource_type=RESOURCE_SKILL_PACKAGE,
+                resource_key=str(package.id),
+                is_owner=str(user_id) == str(package.created_by),
+            )
 
     def persist_knowledge_base_ids(self, agent_id: str, knowledge_base_ids: list[str]) -> None:
         """Persist composer knowledge-base defaults without reloading harness."""
@@ -2486,7 +3198,7 @@ class AgentManager:
         except ExceptionGroup as exc:
             # Starlette/anyio may wrap a single UnicodeDecodeError in a group.
             if not any(
-                isinstance(inner, (OSError, PermissionError, UnicodeDecodeError, UnicodeError))
+                isinstance(inner, OSError | PermissionError | UnicodeDecodeError | UnicodeError)
                 for inner in exc.exceptions
             ):
                 raise
@@ -2547,10 +3259,7 @@ class AgentManager:
             return harness_rows
 
         disabled = skills_disabled_set(cfg)
-        store = SkillPackageStore(
-            repo=self._repos.skill_package_repo,
-            root=self._paths.skill_packages_dir,
-        )
+        store = self._skill_package_store()
         package_by_slug: dict[str, dict[str, Any]] = {}
         for package_id in package_ids:
             if self._repos.skill_package_repo.get(package_id) is None:
@@ -2624,10 +3333,6 @@ class AgentManager:
             return
         setter = getattr(agent, "set_tools_disabled", None)
         if callable(setter):
-            from octop.infra.backend.isolation import HOST_TOOLS, isolation_enabled
-
-            if isolation_enabled():
-                disabled = set(disabled) | HOST_TOOLS
             setter(disabled)
 
     def strip_team_host_runtime_tools(self, agent_id: str) -> None:
@@ -2727,6 +3432,7 @@ class AgentManager:
                     row.name,
                 )
                 return existing
+            self._bootstrap_known.pop(row.agent_id, None)
             try:
                 from octop.infra.agents.teams import is_team_agent  # noqa: PLC0415
 
@@ -2828,6 +3534,7 @@ class AgentManager:
             agent_id = row.agent_id
 
             def _on_bootstrap_complete() -> None:
+                self._bootstrap_known[agent_id] = True
                 self._mark_bootstrap_graph_refresh_pending(agent_id, agent)
 
             agent.on_bootstrap_complete = _on_bootstrap_complete
@@ -2866,13 +3573,7 @@ class AgentManager:
 
     def _agent_config_dict(self, row: AgentRow) -> dict[str, Any]:
         cfg = parse_config_json(row.config_json)
-        from octop.infra.backend.isolation import isolated_config, isolation_enabled
-
-        cfg = isolated_config(overlay_skill_package_ids(cfg, row))
-        if isolation_enabled():
-            cfg["workspace_dir"] = str(self._paths.agents_dir / row.agent_id)
-            cfg["backend"] = {"type": "docker"}
-        return cfg
+        return overlay_skill_package_ids(cfg, row)
 
     def _backend_spec_for_row(
         self,
@@ -2886,12 +3587,25 @@ class AgentManager:
         backend_spec = cfg.get("backend")
         if workspace_dir is None:
             workspace_dir = self.resolve_workspace_dir(row.agent_id)
-        from octop.infra.backend.isolation import isolated_spec, isolation_enabled
-
-        if isolation_enabled():
-            return isolated_spec(
-                self._paths, row.agent_id, workspace_dir, instance_key=f"{row.id}:{row.user_id}"
+        if row.user_id is not None:
+            from octop.infra.users.resource_policy import (
+                POLICY_WORKSPACE_ROOT_DIR,
+                clamp_backend_to_workspace_root,
+                effective_workspace_root_dir,
+                persisted_workspace_within_root,
             )
+
+            allowed = effective_workspace_root_dir(
+                self._repos.user_policy_repo.get(row.user_id, POLICY_WORKSPACE_ROOT_DIR)
+            )
+            # Only rewrite a root the files already live under. Creating an
+            # expert persists the snapped backend before the workspace exists;
+            # startup must not jail a host workspace that was seeded earlier.
+            if allowed and persisted_workspace_within_root(cfg, allowed):
+                try:
+                    backend_spec = clamp_backend_to_workspace_root(backend_spec, allowed)
+                except ValueError as exc:
+                    raise OctopError(ErrorCode.WORKSPACE_ROOT_RESTRICTED, str(exc)) from exc
         if backend_spec is None:
             return default_agent_backend_spec(workspace_dir)
         resolved = resolve_agent_backend_spec(
@@ -2923,11 +3637,7 @@ class AgentManager:
 
     def _prepare_docker_backend(self, backend: Any, row: AgentRow) -> Any:
         """Inject Octop docker defaults (prefix / agent_id / username) without overwrite."""
-        if (
-            not isinstance(backend, dict)
-            or backend.get("type") != "docker"
-            or backend.get("_octop_isolated")
-        ):
+        if not isinstance(backend, dict) or backend.get("type") != "docker":
             return backend
         from octop.infra.utils.env_file import env_file_path  # noqa: PLC0415
 
@@ -2947,11 +3657,11 @@ class AgentManager:
         allow_ephemeral_remote: bool = False,
     ) -> Any:
         """Resolve :class:`BackendWorkspace` for *row* without a running harness agent."""
-        from octop_harness.backends import resolve_backend  # noqa: PLC0415
         from octop_harness.backends.workspace import BackendWorkspace  # noqa: PLC0415
 
         from octop.infra.agents.workspace.dir import system_files_path_from_config  # noqa: PLC0415
         from octop.infra.backend.opensandbox_deps import ensure_opensandbox_deps  # noqa: PLC0415
+        from octop.infra.backend.resolve_backend import resolve_octop_backend  # noqa: PLC0415
 
         if cfg is None:
             cfg = self._agent_config_dict(row)
@@ -2961,35 +3671,6 @@ class AgentManager:
             self._backend_spec_for_row(row, cfg=cfg, workspace_dir=workspace_dir),
             row,
         )
-        if isinstance(backend, dict) and backend.get("_octop_isolated"):
-            from octop.infra.backend.isolation import create_isolated_backend
-
-            package_dirs = self._resolve_skill_package_dirs(row.agent_id)
-            cache_key = json.dumps([backend, package_dirs], sort_keys=True)
-            cached = self._isolated_backends.get(cache_key)
-            if cached is None or getattr(cached, "_closed", False):
-                package_mounts: dict[str, str] = {}
-                host_data = os.environ.get("OCTOP_SANDBOX_HOST_DATA_DIR", "").strip()
-                for directory in package_dirs:
-                    package = Path(directory)
-                    package.relative_to(self._paths.skill_packages_dir)
-                    relative = package.relative_to(self._paths.root)
-                    if not host_data or not Path(host_data).is_absolute():
-                        raise OctopError(
-                            ErrorCode.WORKSPACE_OP_UNSUPPORTED,
-                            "sandbox skill-package host mapping is required",
-                        )
-                    if package.is_symlink() or any(p.is_symlink() for p in package.rglob("*")):
-                        raise OctopError(
-                            ErrorCode.WORKSPACE_ROOT_RESTRICTED,
-                            "skill packages must not contain symlinks",
-                        )
-                    package_mounts[str(Path(host_data) / relative)] = directory
-                cached = create_isolated_backend(
-                    backend, package_mounts=package_mounts, managed_lifecycle=True
-                )
-                self._isolated_backends[cache_key] = cached
-            backend = cached
         if self._spec_is_opensandbox(backend) and not allow_ephemeral_remote:
             # Stopped-agent / seed fallback: do not create a throwaway remote sandbox.
             backend = {
@@ -3002,7 +3683,7 @@ class AgentManager:
         from octop.infra.backend.compat import adapt_backend_protocol  # noqa: PLC0415
 
         return BackendWorkspace(
-            adapt_backend_protocol(resolve_backend(backend, workspace_dir=workspace_dir)),
+            adapt_backend_protocol(resolve_octop_backend(backend, workspace_dir=workspace_dir)),
             workspace_dir,
             system_files_path=system_files_path_from_config(cfg),
         )
@@ -3229,7 +3910,7 @@ class AgentManager:
             extra["quick_prompts"] = prompts if isinstance(prompts, list) else []
             if not (row_description or "").strip():
                 desc = data.get("description")
-                if isinstance(desc, (str, dict)) and desc:
+                if isinstance(desc, str | dict) and desc:
                     extra["description"] = desc
             break
         return extra
@@ -3251,15 +3932,6 @@ class AgentManager:
         from octop_harness.plugins import collect_plugin_tool_configs  # noqa: PLC0415
 
         req = dict(request)
-        from octop.infra.backend.isolation import isolation_enabled
-
-        if isolation_enabled() and req.get("user") is not None:
-            row = self.get_row(agent_id)
-            caller = str(req["user"])
-            if row is not None and str(row.user_id) != caller:
-                user = self._repos.user_repo.get(int(caller)) if caller.isdigit() else None
-                if user is None or user.role != "admin":
-                    raise OctopError(ErrorCode.FORBIDDEN, "isolated expert is not owned by caller")
         if req.get("agent_id") is None:
             req["agent_id"] = agent_id
         agent_cfg = self.get_config(agent_id)
@@ -3350,28 +4022,32 @@ class AgentManager:
 
             cron_tools = build_cronjob_tools(self._cron_manager)
 
-        from types import SimpleNamespace  # noqa: PLC0415
-
-        from octop.infra.knowledge.tools import build_knowledge_tools  # noqa: PLC0415
+        from octop.infra.knowledge.tools import (  # noqa: PLC0415
+            KnowledgeToolServices,
+            build_knowledge_tools,
+        )
 
         knowledge_tools: list[Any] = []
         if not team_host:
-            knowledge_tools = build_knowledge_tools(
-                SimpleNamespace(
-                    knowledge_repo=self._repos.knowledge_repo,
-                    settings_repo=self._repos.settings_repo,
-                    provider_repo=self._repos.provider_repo,
-                )
-            )
+            knowledge_tools = build_knowledge_tools(KnowledgeToolServices(self))
 
         mobile_tools: list[Any] = []
         if not team_host and self._config.capabilities.mobile.enabled:
-            from octop.infra.mobile.tools import build_mobile_tools  # noqa: PLC0415
+            from octop.infra.control.mobile.tools import build_mobile_tools  # noqa: PLC0415
+
+            def _mobile_workspace_for(agent_id: str) -> Any:
+                # Prefer the running agent's workspace — authoritative for
+                # docker / ephemeral remote sandboxes; ws is the start-time
+                # fallback for the agent being configured here.
+                if self._harness_manager is not None:
+                    with suppress(Exception):
+                        return self._harness_manager.get_agent(agent_id).agent.workspace
+                return ws if agent_id == row.agent_id else None
 
             mobile_tools = build_mobile_tools(
                 self._config,
                 user_repo=self._repos.user_repo,
-                paths=self.paths,
+                workspace_for=_mobile_workspace_for,
             )
 
         from octop_harness.plugins import PluginRegistry, build_plugin_tools  # noqa: PLC0415
@@ -3435,11 +4111,10 @@ class AgentManager:
 
         from octop.infra.agents.middleware.binary_read_guard import BinaryReadGuardMiddleware
         from octop.infra.agents.middleware.browser_profile import BrowserProfileMiddleware
-        from octop.infra.agents.middleware.device_tools import (
-            DeviceToolGuardMiddleware,
-            DeviceToolsMiddleware,
+        from octop.infra.agents.middleware.mcp_output_schema import (
+            McpOutputSchemaMiddleware,
+            harness_handles_mcp_tool_errors,
         )
-        from octop.infra.agents.middleware.history_roles import HistoryRolesMiddleware
         from octop.infra.agents.middleware.octop_ui_offload import OctopUiOffloadMiddleware
         from octop.infra.agents.middleware.reasoning import ReasoningRequestMiddleware
         from octop.infra.agents.middleware.thread_artifacts import ThreadArtifactsMiddleware
@@ -3447,7 +4122,6 @@ class AgentManager:
         from octop.infra.agents.middleware.workspace_image import (
             WorkspaceImageMaterializeMiddleware,
         )
-        from octop.infra.db.repos.devices import DeviceRepo
         from octop.infra.knowledge.hint import KnowledgeSearchHintMiddleware
 
         # FilesystemGuard + ModelSettings live in octop-harness (auto-mounted).
@@ -3457,22 +4131,17 @@ class AgentManager:
         # OctopUiOffload stays innermost so every outer middleware observes the
         # slimmed content consistently; it only touches octop_ui plugin envelopes,
         # disjoint from the file-tool results ThreadArtifacts cares about.
-        device_policy = DeviceToolsMiddleware(
-            lambda: self.device_manager, lambda: DeviceRepo(self._repos.db)
-        )
         agent_middleware: list[Any] = [
-            DeviceToolGuardMiddleware(device_policy),
             *plugin_middleware,
             TokenQuotaMiddleware(
                 policy_repo=self._repos.user_policy_repo,
                 usage_repo=self._repos.usage_repo,
             ),
             ReasoningRequestMiddleware(),
-            device_policy,
-            HistoryRolesMiddleware(),
             KnowledgeSearchHintMiddleware(),
             BrowserProfileMiddleware(),
             BinaryReadGuardMiddleware(),
+            *(() if harness_handles_mcp_tool_errors() else (McpOutputSchemaMiddleware(),)),
             WorkspaceImageMaterializeMiddleware(workspace=ws),
             ThreadArtifactsMiddleware(
                 thread_repo=self._repos.thread_repo,
@@ -3590,18 +4259,27 @@ class AgentManager:
         harness_backend: Any = (
             ws.backend
             if (
-                (isinstance(backend, dict) and backend.get("_octop_isolated"))
-                or self._spec_is_opensandbox(backend)
+                self._spec_is_opensandbox(backend)
                 or is_adapted_backend(ws.backend)
                 or is_remote_backend_spec(backend)
             )
             else backend
         )
 
+        harness_fields: dict[str, Any] = {}
+        if "decision" in _HARNESS_AGENT_CONFIG_FIELDS:
+            harness_fields["decision"] = self._decision.harness_config()
+
         harness_cfg = HarnessAgentConfig(
             name=_memory_namespace(row.agent_id),
             workspace_dir=harness_workspace,
             system_files_path=system_files_path_from_config(cfg),
+            # Owner's stored locale only. Per-message language would change
+            # the cached system prefix on every switch.
+            language=resolve_user_locale(
+                user_repo=self._repos.user_repo,
+                user_id=row.user_id or 0,
+            ),
             # Memory aux LLM (extraction / promotion) needs a concrete ref; fall
             # back to the same resolution AUTO chat routing uses (active model
             # first, else first usable) — so promotion works whenever chat does.
@@ -3609,7 +4287,7 @@ class AgentManager:
             # ``resolve_explicit_default_model`` directly.
             default_model=(
                 self._providers.resolve_explicit_default_model(row, cfg)
-                or self.resolve_fallback_model_ref()
+                or self._resolve_configured_fallback_model_ref()
             ),
             system_prompt=system_prompt,
             memory=memory,
@@ -3623,8 +4301,8 @@ class AgentManager:
             skills_disabled=frozenset(skills_disabled_set(cfg) | plugin_skills_disabled),
             skills_dir=skill_dirs or None,
             default_timezone=self._config.default_timezone,
-            log_dir=str(self.paths.logs_dir),
             media_generation=self._media_generation.harness_config(),
+            **harness_fields,
             **_memory_extract_settings(cfg, is_ref_usable=self._providers.is_model_ref_usable),
             **_resolve_memory_backend_kwargs(cfg, workspace_dir=workspace_dir, config=self._config),
         )
@@ -3639,19 +4317,6 @@ class AgentManager:
             )
             if team_host:
                 disabled = set(host_tools_disabled(disabled))
-            from octop.infra.backend.isolation import HOST_TOOLS, isolation_enabled
-
-            if isolation_enabled():
-                disabled = set(disabled) | HOST_TOOLS
-                harness_cfg.acp_runners = {}
-                harness_cfg.acp_delegate_enabled = False
-                harness_cfg.mcp_server_configs = {
-                    key: value
-                    for key, value in mcp_server_configs.items()
-                    if isinstance(value, dict)
-                    and value.get("transport") != "stdio"
-                    and not value.get("command")
-                }
             harness_cfg.tools_disabled = frozenset(disabled)
         applied = policy.apply_to_config(harness_cfg)
         applied = self._apply_team_host_config(applied, row)
@@ -3662,26 +4327,47 @@ class AgentManager:
         if interrupt_on is not applied.interrupt_on:
             applied = replace(applied, interrupt_on=interrupt_on)
         if applied.model_retry_enabled:
-            from langchain.agents.middleware import ModelRetryMiddleware
+            factory = (
+                self._harness_manager.shared_factory if self._harness_manager is not None else None
+            )
+            get_chat_model = getattr(factory, "get_chat_model", None)
+            if callable(get_chat_model):
+                from octop.infra.agents.middleware.model_failover import (
+                    SafeModelFailoverMiddleware,
+                )
 
-            bound_agent_id = row.agent_id
+                retry_middleware: Any = SafeModelFailoverMiddleware(
+                    health=self._model_health,
+                    candidates=lambda _current_ref, needs_multimodal: (
+                        self._providers.list_auto_route_candidates(
+                            needs_multimodal=needs_multimodal
+                        )
+                    ),
+                    model_for_ref=get_chat_model,
+                    max_retries=applied.model_retry_max_retries,
+                    initial_delay=applied.model_retry_initial_delay,
+                    max_delay=applied.model_retry_max_delay,
+                    on_failure="error",
+                )
+            else:
+                from langchain.agents.middleware import ModelRetryMiddleware
 
-            def _on_model_retry_failure(exc: Exception) -> str:
-                return _model_retry_on_failure(exc, agent_id=bound_agent_id, manager=self)
+                retry_middleware = ModelRetryMiddleware(
+                    max_retries=applied.model_retry_max_retries,
+                    initial_delay=applied.model_retry_initial_delay,
+                    max_delay=applied.model_retry_max_delay,
+                    on_failure="error",
+                )
 
             applied = replace(
                 applied,
                 model_retry_enabled=False,
                 middleware=[
-                    ModelRetryMiddleware(
-                        max_retries=applied.model_retry_max_retries,
-                        initial_delay=applied.model_retry_initial_delay,
-                        max_delay=applied.model_retry_max_delay,
-                        on_failure=_on_model_retry_failure,
-                    ),
+                    retry_middleware,
                     *(applied.middleware or []),
                 ],
             )
+        self._tool_guard_rules.ensure_seeded()
         return replace(
             applied,
             tool_guard_rules_dir=str(self._tool_guard_rules.rules_dir),
@@ -3715,6 +4401,8 @@ class AgentManager:
         from octop.infra.connectors.gateway.adapters.agently_cli import write_interrupt_on
 
         if user_id is None:
+            return {}
+        if not self._repos.connector_repo.connector_feature_allows(user_id):
             return {}
         return write_interrupt_on(
             [

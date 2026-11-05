@@ -12,13 +12,6 @@ from octop.infra.db.pool import DatabasePool
 
 # Child-first for DELETE; reverse for INSERT.
 CHAT_TABLES_CHILD_FIRST = (
-    "desktop_file_threads",
-    "company_runtime_operations",
-    "company_runtime_writes",
-    "company_runtime_checkpoints",
-    "company_runtime_events",
-    "company_runtime_tasks",
-    "company_runtime_threads",
     "trajectory_events",
     "thread_messages",
     "thread_history_projection",
@@ -145,8 +138,6 @@ def restore_preserved_chats(pool: DatabasePool, spool_path: Path) -> tuple[int, 
                     conn.execute(f"DELETE FROM {table}")
 
             kept_threads: set[str] = set()
-            kept_company_threads: set[str] = set()
-            kept_tasks: set[str] = set()
             for table in CHAT_TABLES_PARENT_FIRST:
                 columns = _spool_columns(spool, table)
                 if not columns or not _table_exists(conn, table, dialect=dialect):
@@ -171,26 +162,6 @@ def restore_preserved_chats(pool: DatabasePool, spool_path: Path) -> tuple[int, 
                         if mapped is None:
                             skipped += 1
                             continue
-                        if table.startswith("company_runtime_"):
-                            if "thread_id" in col_index:
-                                parent = (
-                                    kept_threads
-                                    if table == "company_runtime_threads"
-                                    else kept_company_threads
-                                )
-                                if str(mapped[col_index["thread_id"]]) not in parent:
-                                    skipped += 1
-                                    continue
-                            if (
-                                table in {"company_runtime_events", "company_runtime_operations"}
-                                and str(mapped[col_index["task_id"]]) not in kept_tasks
-                            ):
-                                skipped += 1
-                                continue
-                            if table == "company_runtime_threads":
-                                kept_company_threads.add(str(mapped[col_index["thread_id"]]))
-                            if table == "company_runtime_tasks":
-                                kept_tasks.add(str(mapped[col_index["task_id"]]))
                         batch.append(mapped)
                         if table == "threads" and "thread_id" in col_index:
                             kept_threads.add(str(mapped[col_index["thread_id"]]))
@@ -326,9 +297,8 @@ def _remap_chat_row(
     values = list(row)
     old_uid: int | None = None
     new_uid: int | None = None
-    user_column = "owner_user_id" if "owner_user_id" in col_index else "user_id"
-    if user_column in col_index:
-        old_raw = values[col_index[user_column]]
+    if "user_id" in col_index:
+        old_raw = values[col_index["user_id"]]
         try:
             old_uid = int(str(old_raw))
         except (TypeError, ValueError):
@@ -336,17 +306,11 @@ def _remap_chat_row(
         new_uid = _map_user_id(old_uid, old_id_to_name, new_name_to_id)
         if new_uid is None:
             return None
-        values[col_index[user_column]] = new_uid
+        values[col_index["user_id"]] = new_uid
         if old_uid != new_uid:
             _apply_user_id_rewrite(table, values, col_index, old_uid=old_uid, new_uid=new_uid)
     if (
-        table
-        in (
-            "trajectory_events",
-            "thread_messages",
-            "thread_history_projection",
-            "desktop_file_threads",
-        )
+        table in ("trajectory_events", "thread_messages", "thread_history_projection")
         and "thread_id" in col_index
         and str(values[col_index["thread_id"]]) not in kept_threads
     ):

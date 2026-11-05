@@ -1,10 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { useEffect } from "react";
 import AuthGuard from "./AuthGuard";
-import { useCurrentUser } from "../hooks/useCurrentUser";
 
 vi.mock("../api/modules/auth", () => ({
   authApi: {
@@ -16,7 +15,6 @@ vi.mock("../api/modules/auth", () => ({
 vi.mock("../api/request", () => ({
   getAuthToken: vi.fn(() => null),
   clearAuthToken: vi.fn(),
-  AUTH_TOKEN_CHANGED_EVENT: "octop:auth-token-changed",
 }));
 
 vi.mock("../utils/locale", () => ({
@@ -90,7 +88,7 @@ describe("AuthGuard offline boot", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText("protected-shell")).toBeInTheDocument());
+    expect(await screen.findByText("protected-shell")).toBeInTheDocument();
     await waitFor(() => {
       expect(authApi.getAuthStatus).toHaveBeenCalledTimes(1);
     });
@@ -131,57 +129,5 @@ describe("AuthGuard offline boot", () => {
     });
     await user.click(retry);
     expect(await screen.findByText("protected-shell")).toBeInTheDocument();
-  });
-
-  it("reloads the user and unmounts old account state after a cross-tab account switch", async () => {
-    const token = (sub: number, iat = 0) =>
-      `header.${btoa(JSON.stringify({ sub, sid: `s${sub}`, iat }))}.sig`;
-    vi.mocked(getAuthToken).mockReturnValue(token(1));
-    vi.mocked(authApi.getAuthStatus).mockResolvedValue({
-      setup_required: false,
-      has_admin: true,
-    } as never);
-    vi.mocked(authApi.me)
-      .mockResolvedValueOnce({
-        id: 1,
-        username: "admin",
-        role: "admin",
-        locale: "zh",
-      } as never)
-      .mockResolvedValueOnce({
-        id: 2,
-        username: "employee",
-        role: "user",
-        locale: "zh",
-      } as never);
-    let mounts = 0;
-    function Account() {
-      const user = useCurrentUser();
-      useEffect(() => {
-        mounts++;
-      }, []);
-      return <div>{user?.username}</div>;
-    }
-    render(
-      <MemoryRouter>
-        <AuthGuard>
-          <Account />
-        </AuthGuard>
-      </MemoryRouter>,
-    );
-    await screen.findByText("admin");
-    act(() => {
-      vi.mocked(getAuthToken).mockReturnValue(token(1, 10));
-      window.dispatchEvent(new StorageEvent("storage", { key: "auth_token" }));
-    });
-    expect(authApi.me).toHaveBeenCalledTimes(1);
-    expect(mounts).toBe(1);
-    act(() => {
-      vi.mocked(getAuthToken).mockReturnValue(token(2));
-      window.dispatchEvent(new StorageEvent("storage", { key: "auth_token" }));
-    });
-    expect(screen.queryByText("admin")).toBeNull();
-    await screen.findByText("employee");
-    expect(mounts).toBe(2);
   });
 });

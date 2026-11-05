@@ -1,10 +1,9 @@
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { renderHook, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 import { useChatNavigation } from "./useChatNavigation";
 import type { Session } from "./useSessions";
-import { ConversationPageVisibility } from "../../../hooks/useConversationPageVisible";
 
 const navigateMock = vi.fn();
 const rebindMock = vi.fn().mockResolvedValue({});
@@ -63,87 +62,6 @@ function session(id: string): Session {
     hasActivity: true,
   };
 }
-
-describe("useChatNavigation hidden tab", () => {
-  beforeEach(() => {
-    navigateMock.mockReset();
-    rebindMock.mockReset().mockResolvedValue({});
-  });
-
-  function navigationParams() {
-    return {
-      routeAgentId: "agent-a",
-      threadId: undefined as string | undefined,
-      resolvedAgentId: "agent-a",
-      activeThreadId: null as string | null,
-      sessions: [session("thr_ok")],
-      sessionsLoading: false,
-      prefillInputRef: { current: "" },
-      loadHistory: vi.fn().mockResolvedValue(undefined),
-      clearMessages: vi.fn(),
-      ensureThreadInList: vi.fn().mockResolvedValue("missing"),
-      fetchSessions: vi.fn().mockResolvedValue([]),
-      refreshAgents: vi.fn().mockResolvedValue(undefined),
-    };
-  }
-
-  it("waits until Agent is visible before restoring the preferred thread", () => {
-    let visible = false;
-    const params = navigationParams();
-    const view = renderHook(() => useChatNavigation(params), {
-      wrapper: ({ children }) => (
-        <MemoryRouter>
-          <ConversationPageVisibility.Provider value={visible}>
-            {children}
-          </ConversationPageVisibility.Provider>
-        </MemoryRouter>
-      ),
-    });
-    expect(navigateMock).not.toHaveBeenCalled();
-    expect(rebindMock).not.toHaveBeenCalled();
-    expect(params.refreshAgents).not.toHaveBeenCalled();
-    visible = true;
-    view.rerender();
-    expect(navigateMock).toHaveBeenCalledWith("/chat/agent-a/thr_ok", {
-      replace: true,
-    });
-  });
-
-  it("ignores a delayed missing-thread redirect after switching to company", async () => {
-    let visible = true;
-    const params = navigationParams();
-    params.threadId = params.activeThreadId = "deleted";
-    let finish!: (result: string) => void;
-    params.ensureThreadInList.mockReturnValueOnce(
-      new Promise<string>((resolve) => {
-        finish = resolve;
-      }),
-    );
-    const view = renderHook(() => useChatNavigation(params), {
-      wrapper: ({ children }) => (
-        <MemoryRouter>
-          <ConversationPageVisibility.Provider value={visible}>
-            {children}
-          </ConversationPageVisibility.Provider>
-        </MemoryRouter>
-      ),
-    });
-    visible = false;
-    view.rerender();
-    await act(async () => {
-      finish("missing");
-    });
-    expect(navigateMock).not.toHaveBeenCalled();
-    expect(rebindMock).not.toHaveBeenCalled();
-    visible = true;
-    view.rerender();
-    await waitFor(() =>
-      expect(navigateMock).toHaveBeenCalledWith("/chat/agent-a/thr_ok", {
-        replace: true,
-      }),
-    );
-  });
-});
 
 describe("useChatNavigation stale thread", () => {
   beforeEach(() => {

@@ -11,9 +11,8 @@ import {
   useDesktopChrome,
 } from "./hooks/useDesktopChrome";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { routerBasename } from "./utils/publicUrl";
 import { useTranslation } from "react-i18next";
-import { CommunicationProvider } from "./pages/Messaging/hooks/CommunicationContext";
-import { ConversationNavigationProvider } from "./layouts/ConversationNavigation";
 import MainLayout from "./layouts/MainLayout";
 import LoginPage from "./pages/Login";
 import OidcComplete from "./pages/Login/OidcComplete";
@@ -25,7 +24,6 @@ import { AntdAppProvider } from "./components/AntdAppProvider";
 import GlobalErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider, useTheme } from "./context/ThemeContext";
 import { AgentProvider } from "./context/AgentContext";
-import { DesktopWorkspaceProvider } from "./context/DesktopWorkspaceContext";
 import { LayoutModeProvider } from "./context/LayoutModeContext";
 import { VoiceOutputProvider } from "./context/VoiceOutputContext";
 import { useIsMobile } from "./hooks/useIsMobile";
@@ -143,19 +141,13 @@ function ThemedApp() {
               path="/*"
               element={
                 <AuthGuard>
-                  <DesktopWorkspaceProvider>
-                    <AgentProvider>
-                      <LayoutModeProvider>
-                        <VoiceOutputProvider>
-                          <CommunicationProvider>
-                            <ConversationNavigationProvider>
-                              <MainLayout />
-                            </ConversationNavigationProvider>
-                          </CommunicationProvider>
-                        </VoiceOutputProvider>
-                      </LayoutModeProvider>
-                    </AgentProvider>
-                  </DesktopWorkspaceProvider>
+                  <AgentProvider>
+                    <LayoutModeProvider>
+                      <VoiceOutputProvider>
+                        <MainLayout />
+                      </VoiceOutputProvider>
+                    </LayoutModeProvider>
+                  </AgentProvider>
                 </AuthGuard>
               }
             />
@@ -171,7 +163,7 @@ function App() {
     // `useTransitions` off: with router transitions on, React keeps the old
     // page mounted while a lazy route chunk downloads and never renders the
     // Suspense fallback, so a nav click looks like it did nothing.
-    <BrowserRouter useTransitions={false}>
+    <BrowserRouter basename={routerBasename()} useTransitions={false}>
       <GlobalErrorBoundary>
         <GlobalStyle />
         <ThemeProvider>

@@ -52,9 +52,9 @@ Name "${INFO_PRODUCTNAME}"
 !endif
 OutFile "${INSTALLER_OUTFILE}"
 !if "${WAILS_INSTALL_SCOPE}" == "user"
-    InstallDir "$LOCALAPPDATA\Programs\${OCTOP_INSTALL_DIR_NAME}"
+    InstallDir "$LOCALAPPDATA\Programs\${INFO_PRODUCTNAME}"
 !else
-    InstallDir "$PROGRAMFILES64\${OCTOP_INSTALL_DIR_NAME}"
+    InstallDir "$PROGRAMFILES64\${INFO_PRODUCTNAME}"
 !endif
 ShowInstDetails show
 
@@ -73,13 +73,7 @@ Section
     SetOutPath $INSTDIR
 
     !insertmacro wails.files
-    !ifdef OCTOP_COMPANY_RUNTIME_ZIP
-        File "/oname=${OCTOP_COMPANY_RUNTIME_NAME}" "${OCTOP_COMPANY_RUNTIME_ZIP}"
-    !endif
 
-    ; Replace shortcuts from the previous display name during upgrades.
-    Delete "$SMPROGRAMS\Octop Ent.lnk"
-    Delete "$DESKTOP\Octop Ent.lnk"
     CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
     CreateShortcut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
 
@@ -94,12 +88,7 @@ Section "uninstall"
 
     RMDir /r "$AppData\${PRODUCT_EXECUTABLE}"
 
-    ; Employee workspaces live beside the application. Remove only files owned
-    ; by the installer; never recursively delete project data on uninstall.
-    Delete "$INSTDIR\${PRODUCT_EXECUTABLE}"
-    !ifdef OCTOP_COMPANY_RUNTIME_NAME
-        Delete "$INSTDIR\${OCTOP_COMPANY_RUNTIME_NAME}"
-    !endif
+    RMDir /r $INSTDIR
 
     Delete "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk"
     Delete "$DESKTOP\${INFO_PRODUCTNAME}.lnk"
@@ -108,5 +97,4 @@ Section "uninstall"
     !insertmacro wails.unassociateCustomProtocols
 
     !insertmacro wails.deleteUninstaller
-    RMDir "$INSTDIR"
 SectionEnd

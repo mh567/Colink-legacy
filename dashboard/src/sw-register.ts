@@ -1,3 +1,5 @@
+import { publicUrl } from "./utils/publicUrl";
+
 /**
  * Service Worker registration and lifecycle management.
  *
@@ -10,12 +12,7 @@
  * Dev:
  *   - Do not register. Clear any leftover production SW on the same origin
  *     so Vite HMR and an old worker do not fight over navigations.
- * Managed desktop:
- *   - Remove legacy workers and caches. Packaged assets follow the installer;
- *     page update events must not reload the client or restart the server.
  */
-
-import { isCompanyDesktop } from "./api/desktopRuntime";
 
 let pendingRegistration: ServiceWorkerRegistration | null = null;
 let applyingUpdate = false;
@@ -38,7 +35,6 @@ async function unregisterAllServiceWorkers(): Promise<void> {
  * Only called from explicit UI actions (PwaUpdatePrompt).
  */
 export async function applyUpdate(): Promise<void> {
-  if (isCompanyDesktop()) return;
   if (applyingUpdate) return;
   applyingUpdate = true;
   const waiting = pendingRegistration?.waiting;
@@ -70,11 +66,14 @@ export async function applyUpdate(): Promise<void> {
 
 /** Production registration. Exported for unit tests (vitest always sets DEV). */
 export async function registerProductionSW(): Promise<void> {
-  if (isCompanyDesktop()) return;
-  const registration = await navigator.serviceWorker.register("/sw.js", {
-    scope: "/",
-    updateViaCache: "none",
-  });
+  const scope = import.meta.env.BASE_URL || "/";
+  const registration = await navigator.serviceWorker.register(
+    publicUrl("sw.js"),
+    {
+      scope,
+      updateViaCache: "none",
+    },
+  );
 
   // Intentionally no controllerchange → location.reload() listener.
   // Chrome and Safari both pick up new assets via applyUpdate() instead.
@@ -129,11 +128,11 @@ export async function registerProductionSW(): Promise<void> {
 export async function registerSW(): Promise<void> {
   if (!("serviceWorker" in navigator)) return;
 
-  if (import.meta.env.DEV || isCompanyDesktop()) {
+  if (import.meta.env.DEV) {
     try {
       await unregisterAllServiceWorkers();
     } catch (err) {
-      console.warn("[SW] Cleanup failed:", err);
+      console.warn("[SW] Dev cleanup failed:", err);
     }
     return;
   }

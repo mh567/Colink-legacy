@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,6 @@ class PreparedDashboardTurn:
     inbound_content: list[ContentPart]
     composer_context: dict[str, Any] | None
     inbound_attachments: list[dict[str, str]]
-    device_task: str | None = None
 
 
 async def resolve_thread_id(
@@ -85,6 +85,28 @@ async def resolve_thread_id(
         channel_type=ThreadRegistry.CHANNEL_DASHBOARD,
     )
     return tid, sk
+
+
+# Optimistic dashboard bubble ids (`Date.now()` plus a short base36 suffix).
+_CLIENT_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def client_message_id_from_turn(turn: ChatTurnBody) -> str | None:
+    """Id of the user bubble this turn should be stored as.
+
+    The dashboard sends the id it already drew. Anything else is ignored so a
+    channel turn keeps a server-assigned id.
+    """
+    for message in reversed(turn.messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "user").lower() != "user":
+            continue
+        raw = message.get("id")
+        if isinstance(raw, str) and _CLIENT_MESSAGE_ID_RE.fullmatch(raw.strip()):
+            return raw.strip()
+        return None
+    return None
 
 
 def _turn_plain_text(turn: ChatTurnBody) -> str:
@@ -233,16 +255,6 @@ async def prepare_dashboard_turn(
 ) -> PreparedDashboardTurn:
     """Validate MCP/skills, resolve thread, return data for gateway enqueue."""
     row = require_agent_row(agent_id, user=user, as_user=None, server=server)
-    if turn.device is not None:
-        if row.user_id != user.id or row.is_shared or row.kind != "expert" or turn.target_agent_ids:
-            raise OctopError(
-                ErrorCode.FORBIDDEN,
-                "Local file tasks require your private expert; team delegation is not enabled.",
-            )
-        if server.devices is None:
-            raise OctopError(ErrorCode.FORBIDDEN, "Device channel is disabled")
-        # Local file content must not be presented to arbitrary MCP/skill processes.
-        turn = turn.model_copy(update={"mcp_servers": [], "skills": []})
     default_model = (row.default_model or "").strip() or None
 
     mcp_servers = await validate_chat_mcp_servers(server, user_id=user.id, names=turn.mcp_servers)
@@ -274,13 +286,6 @@ async def prepare_dashboard_turn(
         thread_id=turn.thread_id,
         session_key=turn.session_key,
     )
-    runtime_repo = getattr(server.services, "company_runtime_repo", None)
-    if runtime_repo is not None and runtime_repo.binding(thread_id):
-        raise OctopError(
-            ErrorCode.FORBIDDEN,
-            "company_local_thread_read_only_on_server",
-            details={"reason": "company_local_thread_read_only_on_server"},
-        )
     model_ref = (turn.default_model or "").strip() or None
     if (
         model_ref is not None
@@ -290,6 +295,11 @@ async def prepare_dashboard_turn(
             ErrorCode.SLASH_BAD_ARGS,
             "default_model must reference an enabled model",
         )
+    if model_ref is not None and not server.app_runtime.agent_registry.model_ref_allowed_for_user(
+        user.id,
+        model_ref,
+    ):
+        raise OctopError(ErrorCode.RESOURCE_NOT_ALLOWED, "resource is not visible to this user")
     composer_updates: dict[str, Any] = {}
     if model_ref is not None:
         composer_updates["model_ref"] = model_ref
@@ -309,21 +319,6 @@ async def prepare_dashboard_turn(
     )
     inbound_content = content_parts_from_dashboard_turn(turn)
     inbound_attachments = inbound_attachments_from_parts(inbound_content)
-    device_task = None
-    if turn.device is not None:
-        thread = thread_registry.get_thread(thread_id)
-        if thread is None or thread.user_id != user.id or thread.agent_id != agent_id:
-            raise OctopError(ErrorCode.FORBIDDEN, "Device task thread is not owned by user")
-        device_task = await server.devices.bind_task(
-            owner=user.id,
-            agent_id=agent_id,
-            thread_id=thread_id,
-            session_key=session_key,
-            selection=turn.device,
-        )
-        from octop.infra.devices.manager import _db
-
-        await _db(server.services.device_repo.mark_file_thread, thread_id)
     return PreparedDashboardTurn(
         thread_id=thread_id,
         session_key=session_key,
@@ -333,7 +328,6 @@ async def prepare_dashboard_turn(
         inbound_content=inbound_content,
         composer_context=composer_ctx,
         inbound_attachments=inbound_attachments,
-        device_task=device_task,
     )
 
 
@@ -352,10 +346,6 @@ def build_dashboard_inbound(
         "thread_id": prepared.thread_id,
         "user_is_admin": user_is_admin,
     }
-    if prepared.device_task:
-        from octop.infra.devices.tasks import CONFIG_KEY
-
-        metadata[CONFIG_KEY] = prepared.device_task
     if prepared.mcp_servers is not None:
         # Including [] — Dashboard opt-out of default_open for this turn.
         metadata["mcp_servers"] = list(prepared.mcp_servers)
@@ -378,6 +368,9 @@ def build_dashboard_inbound(
         metadata[COMPOSER_CTX_KEY] = prepared.composer_context
     if prepared.inbound_attachments:
         metadata[INBOUND_ATTACHMENTS_KEY] = prepared.inbound_attachments
+    client_message_id = client_message_id_from_turn(turn)
+    if client_message_id:
+        metadata["client_message_id"] = client_message_id
     merge_turn_target_agents(turn, metadata)
 
     return InboundMessage(
