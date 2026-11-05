@@ -2,10 +2,10 @@ import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import { Tooltip } from "antd";
 import { ArrowUpCircle } from "lucide-react";
+import cx from "classnames";
 import { useUpdateStatus } from "../../hooks/useUpdateStatus";
 import { useCurrentUser } from "../../hooks/useCurrentUser";
 import { userCan } from "../../utils/permissions";
-import { isCompanyDesktop } from "../../api/desktopRuntime";
 import styles from "./index.module.less";
 
 interface AppVersionBadgeProps {
@@ -16,8 +16,9 @@ export default function AppVersionBadge({ isMobile }: AppVersionBadgeProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const user = useCurrentUser();
-  const canUpdate = !isCompanyDesktop() && userCan(user, "update");
-  const { status, hasUpdate } = useUpdateStatus(canUpdate);
+  const { status, hasUpdate } = useUpdateStatus();
+
+  const canUpdate = userCan(user, "update");
   if (!status?.current_version || !hasUpdate || !canUpdate) return null;
 
   const tooltip = t("header.versionUpdateAvailable", {
@@ -34,9 +35,11 @@ export default function AppVersionBadge({ isMobile }: AppVersionBadgeProps) {
     <Tooltip title={tooltip} mouseEnterDelay={0.35}>
       <button
         type="button"
-        className={`${styles.headerVersion} ${
-          isMobile ? styles.headerVersionMobile : ""
-        } ${styles.headerVersionClickable}`}
+        className={cx(
+          styles.headerVersion,
+          isMobile && styles.headerVersionMobile,
+          styles.headerVersionClickable,
+        )}
         onClick={handleClick}
         aria-label={tooltip}
       >

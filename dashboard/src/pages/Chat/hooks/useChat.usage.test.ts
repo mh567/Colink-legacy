@@ -1,61 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { convertHistoryMessages } from "./useChat";
+import { splitAssistantTurn } from "../utils/messageContent";
 
 describe("history token usage", () => {
-  it("restores desktop image receipts without constructing a server media URL", () => {
-    const path = "C:\\work\\inbound\\image.png";
-    const sha256 = "a".repeat(64);
-    const messages = convertHistoryMessages(
-      [
-        {
-          role: "user",
-          id: "desktop-user",
-          content: `Edit this\n\n[file: ${path}]`,
-          inbound_attachments: [
-            {
-              workspace_path: path,
-              filename: "image.png",
-              media_type: "image/png",
-              kind: "image",
-              execution_location: "desktop",
-              size: 42,
-              sha256,
-            },
-          ],
-        },
-      ],
-      "agent_1",
-    );
-    expect(messages[0].attachments).toEqual([
-      expect.objectContaining({
-        url: "",
-        workspacePath: path,
-        kind: "image",
-        localFile: { path, size: 42, sha256 },
-      }),
-    ]);
-  });
-
-  it("does not turn incomplete desktop attachment receipts into server attachments", () => {
-    const messages = convertHistoryMessages(
-      [
-        {
-          role: "user",
-          content: "Edit",
-          inbound_attachments: [
-            {
-              workspace_path: "C:\\work\\image.png",
-              filename: "image.png",
-              execution_location: "desktop",
-            },
-          ],
-        },
-      ],
-      "agent_1",
-    );
-    expect(messages[0].attachments).toBeUndefined();
-  });
-
   it("normalizes provider cache details and rolls up every model call", () => {
     const messages = convertHistoryMessages([
       { role: "user", content: "hello", id: "u1" },
@@ -235,5 +182,87 @@ describe("history token usage", () => {
       "ask_user_question",
     );
     expect(messages[1]?.status).toBe("done");
+  });
+
+  it("keeps a decision notice on the tool turn so history can fold it", () => {
+    const messages = convertHistoryMessages([
+      { role: "user", content: "读一下 pdf", id: "u1" },
+      {
+        role: "assistant",
+        id: "a1",
+        content: [
+          {
+            type: "tool_use",
+            name: "read_file",
+            id: "call-1",
+            input: { path: "notes.pdf" },
+          },
+        ],
+        decision: {
+          kind: "decision",
+          model: "typesafe/jev-1.13",
+          empty: false,
+          parts: [{ kind: "skill", kept: [{ name: "pdf", score: 0.9 }] }],
+        },
+      },
+      {
+        role: "tool",
+        id: "t1",
+        content: [
+          {
+            type: "tool_result",
+            id: "call-1",
+            name: "read_file",
+            output: "ok",
+          },
+        ],
+      },
+      { role: "assistant", content: "读完了", id: "a2" },
+    ]);
+    const split = splitAssistantTurn(messages.slice(1));
+    expect(split.processSteps[0]).toMatchObject({
+      kind: "decision",
+      notice: { model: "typesafe/jev-1.13" },
+    });
+    expect(split.tools).toHaveLength(1);
+  });
+
+  it("keeps a decision-only history row", () => {
+    const messages = convertHistoryMessages([
+      { role: "user", content: "直接回答", id: "u1" },
+      {
+        role: "assistant",
+        content: "",
+        id: "a1",
+        decision: {
+          kind: "decision",
+          model: "laya",
+          empty: true,
+          parts: [],
+        },
+      },
+    ]);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]?.decision?.model).toBe("laya");
+  });
+
+  it("sums decision savings across the model calls in one turn", () => {
+    const messages = convertHistoryMessages([
+      { role: "user", content: "读一下", id: "u1" },
+      {
+        role: "assistant",
+        content: "先看",
+        id: "a1",
+        usage: { input_tokens: 100, output_tokens: 5, decision_saved: 4000 },
+      },
+      {
+        role: "assistant",
+        content: "看完了",
+        id: "a2",
+        usage: { input_tokens: 120, output_tokens: 6, decision_saved: 4000 },
+      },
+    ]);
+    expect(messages[1]?.usage).toBeUndefined();
+    expect(messages[2]?.usage?.decision_saved).toBe(8000);
   });
 });

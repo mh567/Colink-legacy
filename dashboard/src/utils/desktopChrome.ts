@@ -1,8 +1,5 @@
 type DesktopWindow = Window & {
-  _wails?: {
-    invoke?: (message: string) => void;
-    flags?: { octopNativeTitlebar?: boolean };
-  };
+  _wails?: { invoke?: (message: string) => void };
 };
 
 export type DesktopChromeStyle = "mac" | "windows";
@@ -59,14 +56,7 @@ export function isDesktopShell(
 
 export function resolveDesktopChromeStyle(
   userAgent = navigator.userAgent,
-): DesktopChromeStyle | null {
-  // Native shells declare the capability; older frameless clients retain their
-  // HTML controls when they load the same server dashboard.
-  if (
-    userAgent.includes("OctopNativeTitlebar/1") ||
-    (window as DesktopWindow)._wails?.flags?.octopNativeTitlebar === true
-  )
-    return null;
+): DesktopChromeStyle {
   if (/Mac|iPhone|iPad/.test(userAgent)) return "mac";
   return "windows";
 }
@@ -130,11 +120,7 @@ export function installDesktopWindowDrag(
   win: DesktopWindow = window as DesktopWindow,
 ): boolean {
   const invoke = win._wails?.invoke;
-  if (
-    typeof invoke !== "function" ||
-    !resolveDesktopChromeStyle(win.navigator.userAgent)
-  )
-    return false;
+  if (typeof invoke !== "function") return false;
   const root = document.documentElement;
   if (root.dataset.octopDragReady === "1") return false;
   root.dataset.octopDragReady = "1";
@@ -145,7 +131,6 @@ export function installDesktopWindowDrag(
   win.addEventListener(
     "mousedown",
     (event) => {
-      if (!resolveDesktopChromeStyle(win.navigator.userAgent)) return;
       if (!shouldArmDesktopDrag(event)) return;
       armed = true;
       startX = event.screenX;
@@ -156,10 +141,6 @@ export function installDesktopWindowDrag(
   win.addEventListener(
     "mousemove",
     (event) => {
-      if (!resolveDesktopChromeStyle(win.navigator.userAgent)) {
-        armed = false;
-        return;
-      }
       if (!armed) return;
       if (
         Math.abs(event.screenX - startX) < 3 &&
@@ -182,7 +163,6 @@ export function installDesktopWindowDrag(
   win.addEventListener(
     "dblclick",
     (event) => {
-      if (!resolveDesktopChromeStyle(win.navigator.userAgent)) return;
       if (!shouldArmDesktopDrag(event)) return;
       invoke("wails:drag:doubleclick");
     },

@@ -1,9 +1,10 @@
-"""`octop update` — disabled for this source distribution."""
+"""`octop update` — self-upgrade via pip or uv."""
 
 from __future__ import annotations
 
 import click
 
+from octop.cli.support.db import resolve_cli_locale
 from octop.infra.setup.self_update import (
     fetch_pypi_info,
     get_editable_path,
@@ -12,7 +13,6 @@ from octop.infra.setup.self_update import (
     is_prerelease,
     resolve_venv_python,
     run_upgrade,
-    self_update_disabled_reason,
 )
 
 
@@ -28,9 +28,7 @@ from octop.infra.setup.self_update import (
     help="Include and allow installing pre-releases (alpha / beta / rc / dev).",
 )
 def update(check: bool, yes: bool, verbose: bool, allow_prerelease: bool) -> None:
-    """Disabled for Octop Enterprise; use manual source upgrades."""
-    if reason := self_update_disabled_reason():
-        raise click.ClickException(reason)
+    """Check for and install a newer Octop release."""
     current = get_local_version()
     info = fetch_pypi_info()
     click.echo(f"installed: {current}")
@@ -69,6 +67,7 @@ def update(check: bool, yes: bool, verbose: bool, allow_prerelease: bool) -> Non
         verbose=verbose,
         allow_prerelease=is_prerelease(latest),
         version=latest,
+        locale=resolve_cli_locale(),
     )
     if not result.success:
         click.echo(f"upgrade failed: {result.error}", err=True)

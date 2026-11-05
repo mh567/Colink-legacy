@@ -18,7 +18,6 @@ def test_defaults_when_missing(tmp_path: Path):
     assert cfg.access_token_ttl_seconds == 86400
     assert cfg.enable_dashboard is True
     assert cfg.enable_api_docs is False
-    assert cfg.device_channel_enabled is False
     assert cfg.require_setup_password is True
     assert cfg.database.driver == "sqlite"
     assert cfg.database.sqlite_path == "octop.db"
@@ -275,13 +274,6 @@ def test_feature_flags_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert cfg.enable_dashboard is False
     assert cfg.enable_api_docs is True
     assert cfg.require_setup_password is False
-
-
-def test_dashboard_cdn_hosts_are_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    path = tmp_path / "config.json"
-    assert load_config(path).dashboard_cdn_hosts == []
-    monkeypatch.setenv("OCTOP_DASHBOARD_CDN_HOSTS", " OCTOP.EXAMPLE.COM., other.example.com ")
-    assert load_config(path).dashboard_cdn_hosts == ["octop.example.com", "other.example.com"]
 
 
 def test_feature_flags_from_file(tmp_path: Path):

@@ -47,7 +47,7 @@ describe("auth token remember / session-only", () => {
     const response = new Response(null, {
       headers: { "X-Octop-Access-Token": "renewed" },
     });
-    mod.applyRenewedAccessToken(response, "old");
+    mod.applyRenewedAccessToken(response);
     expect(mod.getAuthToken()).toBe("renewed");
     expect(mod.isSessionOnlyAuth()).toBe(true);
     expect(sessionStorage.getItem("auth_token")).toBe("renewed");
@@ -65,35 +65,4 @@ describe("auth token remember / session-only", () => {
     expect(mod.getAuthToken()).toBe("");
     expect(sessionStorage.getItem("auth_token")).toBeNull();
   });
-
-  it.each(["logout", "another account"])(
-    "ignores a late renewal after %s",
-    async (action) => {
-      mod.setAuthToken("old-session");
-      let complete!: (response: Response) => void;
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(
-          () =>
-            new Promise<Response>((resolve) => {
-              complete = resolve;
-            }),
-        ),
-      );
-      const pending = mod.request("/im/contacts");
-      if (action === "logout") mod.clearAuthToken();
-      else mod.setAuthToken("new-session");
-      complete(
-        new Response("{}", {
-          headers: {
-            "content-type": "application/json",
-            "X-Octop-Access-Token": "old-renewed",
-          },
-        }),
-      );
-      await pending;
-      expect(mod.getAuthToken()).toBe(action === "logout" ? "" : "new-session");
-      vi.unstubAllGlobals();
-    },
-  );
 });

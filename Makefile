@@ -3,7 +3,7 @@
 #   make              - Show this help
 #   make all          - format (BE+FE) + backend lint + typecheck + test (ship bar)
 #   make build        - Build frontend + Python wheel
-#   make publish      - Disabled until an independent release channel exists
+#   make publish      - Build + upload to PyPI
 #
 # Prerequisites:
 #   - Node.js + npm   (frontend)
@@ -45,8 +45,8 @@ help:
 	@echo "  build-wheel      Build Python wheel only (assumes frontend built)"
 	@echo ""
 	@echo "Publish targets:"
-	@echo "  publish          Disabled for this distribution (see docs/open-source-release.md)"
-	@echo "  publish-test     Disabled for this distribution"
+	@echo "  publish          Build + upload to PyPI (PYPI_TOKEN or prompt)"
+	@echo "  publish-test     Build + upload to TestPyPI"
 	@echo ""
 	@echo "Development targets:"
 	@echo "  dev              Start frontend + backend dev servers"
@@ -127,13 +127,31 @@ build-wheel:
 # ─── Publish ─────────────────────────────────────────────────────────────────
 
 .PHONY: publish
-publish:
-	@echo "Octop Enterprise: automated package publishing is disabled. See docs/open-source-release.md."
-	@exit 1
+publish: build
+	@echo "[publish] Uploading to $(PYPI_REPO)..."
+	@if ! command -v twine > /dev/null 2>&1; then \
+		echo "[publish] twine not found. Installing..."; \
+		$(PIP) install --quiet twine; \
+	fi
+	@_token="$(PYPI_TOKEN)"; \
+	if [ -z "$$_token" ]; then \
+		echo ""; \
+		printf "  PYPI_TOKEN is not set. Enter your PyPI API token (pypi-xxx): "; \
+		read -r _token; \
+		if [ -z "$$_token" ]; then \
+			echo "[publish] No token provided. Aborting."; \
+			exit 1; \
+		fi; \
+	fi; \
+	$(if $(UV),uv run,) twine upload \
+		$(if $(filter testpypi,$(PYPI_REPO)),--repository testpypi,) \
+		--username __token__ --password "$$_token" \
+		$(DIST_DIR)/*
+	@echo "[publish] Upload complete."
 
 .PHONY: publish-test
-publish-test: publish
-
+publish-test:
+	$(MAKE) publish PYPI_REPO=testpypi
 
 # ─── Development ─────────────────────────────────────────────────────────────
 
@@ -317,7 +335,3 @@ clean-online:
 .PHONY: version
 version:
 	@$(PYTHON) -c "import pathlib, re; t = pathlib.Path('pyproject.toml').read_text(); m = re.search(r'^version\\s*=\\s*\"([^\"]+)\"', t, re.M); print(m.group(1) if m else 'unknown')"
-
-.PHONY: check-enterprise
-check-enterprise:
-	uv run python tools/check_enterprise.py $(ARGS)

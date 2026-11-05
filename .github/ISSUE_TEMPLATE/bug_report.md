@@ -24,7 +24,7 @@ labels: bug
 - `octop` version:
 - Python version:
 - OS:
-- Install method: Docker / source (this release)
+- Install method: pip / Docker / source
 - LLM provider (if relevant):
 
 ## Logs / screenshots

@@ -2,7 +2,6 @@ import type { ChatMessage } from "../pages/Chat/hooks/useChat";
 import type { AssistantTurnSplit } from "../pages/Chat/utils/messageContent";
 import {
   collectToolMediaFromToolData,
-  dedupeToolMedia,
   type ToolMediaItem,
 } from "./toolMediaBlocks";
 
@@ -32,11 +31,7 @@ export function collectTurnToolMedia(
     files.push(...batch.files);
   }
 
-  return {
-    images: dedupeToolMedia(images),
-    videos: dedupeToolMedia(videos),
-    files: dedupeToolMedia(files),
-  };
+  return { images, videos, files };
 }
 
 export function collectMessageToolMedia(

@@ -45,7 +45,8 @@ describe("pathPermissionKeys", () => {
     expect(NAV_PERMISSIONS["admin-advanced"]).toEqual(PERM.advancedPage);
     expect(ADVANCED_TAB_PERMISSIONS.captcha).toBe("captcha");
     expect("bridge" in ADVANCED_TAB_PERMISSIONS).toBe(false);
-    expect(pathPermissionKeys("/bridge")).toBeNull();
+    expect(pathPermissionKeys("/bridge")).toEqual([...PERM.bridge]);
+    expect(NAV_PERMISSIONS.bridge).toEqual(PERM.bridge);
     expect([...PERM.advancedPage]).toContain("captcha");
   });
 
@@ -61,8 +62,12 @@ describe("pathPermissionKeys", () => {
 
   it("does not gate common pages", () => {
     expect(pathPermissionKeys("/chat")).toBeNull();
-    expect(pathPermissionKeys("/personalization/skills")).toBeNull();
-    expect(pathPermissionKeys("/bridge")).toBeNull();
+    expect(pathPermissionKeys("/personalization/acp")).toBeNull();
+  });
+
+  it("gates cloud collab behind the bridge permission", () => {
+    expect(pathPermissionKeys("/bridge")).toEqual(["bridge"]);
+    expect(pathPermissionKeys("/bridge/settings")).toEqual(["bridge"]);
   });
 
   it("gates ungrouped pages except chat", () => {
@@ -80,9 +85,25 @@ describe("pathPermissionKeys", () => {
     expect(pathPermissionKeys("/skill-packages")).toEqual([
       ...PERM.skillPackages,
     ]);
+    expect(pathPermissionKeys("/personalization/skills")).toEqual([
+      "skills",
+      "skill_builtin",
+      "skill_market",
+    ]);
     expect(pathPermissionKeys("/personalization/channels")).toEqual([
       ...PERM.channels,
     ]);
+    expect(pathPermissionKeys("/personalization/tools")).toEqual([
+      ...PERM.tools,
+    ]);
+    expect(pathPermissionKeys("/personalization/plugins")).toEqual([
+      ...PERM.agentPlugins,
+    ]);
+    expect(pathPermissionKeys("/personalization/memory")).toEqual([
+      ...PERM.memory,
+    ]);
+    expect(pathPermissionKeys("/memory")).toEqual([...PERM.memory]);
+    expect(NAV_PERMISSIONS.personalization).toEqual(PERM.personalization);
     expect(pathPermissionKeys("/knowledge-bases")).toEqual([
       ...PERM.knowledgeBasesPage,
     ]);
@@ -133,28 +154,4 @@ describe("unknown dashboard paths", () => {
   it("are caught by the not-found route", () => {
     expect(routeConfigs.some((rc) => rc.path === "*")).toBe(true);
   });
-});
-
-it("gates messaging routes independently from AI and department administration", () => {
-  for (const path of [
-    "/contacts",
-    "/contacts/alice",
-    "/messages",
-    "/messages/colleague",
-  ]) {
-    expect(resolveSelectedKey(path)).toBe("contacts");
-  }
-  expect(resolveSelectedKey("/chat/expert/thread")).toBe("chat");
-  const user = { role: "user", permissions: ["messaging"] };
-  expect(canAccessPath(user, "/messages/c")).toBe(true);
-  expect(canAccessPath(user, "/contacts")).toBe(false);
-  expect(canAccessPath(user, "/admin/departments")).toBe(false);
-  expect(canAccessPath(user, "/chat")).toBe(true);
-  expect(
-    canAccessPath(
-      { role: "user", permissions: ["departments"] },
-      "/admin/users",
-    ),
-  ).toBe(true);
-  expect(resolveSelectedKey("/messages/c")).toBe("contacts");
 });

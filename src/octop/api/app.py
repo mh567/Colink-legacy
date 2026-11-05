@@ -30,9 +30,7 @@ class _RouterMount:
     tags: Sequence[str]
 
 
-_NO_CACHE_DASHBOARD_NAMES = frozenset(
-    {"sw.js", "manifest.json", "index.html", "desktop-login.html"}
-)
+_NO_CACHE_DASHBOARD_NAMES = frozenset({"sw.js", "manifest.json", "index.html"})
 
 
 def dashboard_cache_control(full_path: str) -> str | None:
@@ -43,6 +41,10 @@ def dashboard_cache_control(full_path: str) -> str | None:
     # Vite emits content-hashed files under assets/ — safe to pin forever.
     if full_path.startswith("assets/"):
         return "public, max-age=31536000, immutable"
+    # monaco-editor's min/vs tree is copied unhashed. Revalidate so an upgrade
+    # does not keep an editor.main.js that points at removed worker names.
+    if full_path.startswith("monaco/"):
+        return "no-cache"
     return None
 
 
@@ -54,25 +56,17 @@ def _dashboard_response(path: Path, full_path: str) -> FileResponse:
     return response
 
 
-def dashboard_directory(root: Path, hostname: str | None, cdn_hosts: Sequence[str]) -> Path:
-    """Use the optional CDN build only for explicitly configured public hosts."""
-    if (
-        hostname
-        and hostname.lower().rstrip(".") in cdn_hosts
-        and (root / "cdn" / "index.html").is_file()
-    ):
-        return root / "cdn"
-    return root
-
-
 def is_dashboard_asset_path(full_path: str) -> bool:
-    """True for hashed build artifacts that must 404 instead of falling back."""
-    return full_path.startswith("assets/")
+    """True for build artifacts that must 404 instead of falling back to the SPA.
+
+    ``/assets/*`` are content-hashed scripts. ``/monaco/*`` is the vendored
+    editor tree. Returning ``index.html`` for either makes the browser treat
+    HTML as a script or worker.
+    """
+    return full_path.startswith(("assets/", "monaco/"))
 
 
-def _dashboard_fallback(
-    index_file: Path, full_path: str, *, public_edge_cache: bool = False
-) -> FileResponse:
+def _dashboard_fallback(index_file: Path, full_path: str) -> FileResponse:
     """Serve the SPA shell for routes; 404 for a missing hashed asset.
 
     Answering ``/assets/index.<old-hash>.js`` with ``index.html`` makes the
@@ -81,12 +75,7 @@ def _dashboard_fallback(
     """
     if is_dashboard_asset_path(full_path):
         raise HTTPException(status_code=404, detail="Not Found")
-    response = _dashboard_response(index_file, "")
-    if public_edge_cache:
-        # The shell contains no account data. Browsers still revalidate it;
-        # the explicit public-host cache rule may keep it at the edge briefly.
-        response.headers["Cloudflare-CDN-Cache-Control"] = "public, max-age=60"
-    return response
+    return _dashboard_response(index_file, "")
 
 
 def _mount_routers(app: FastAPI, mounts: Sequence[_RouterMount]) -> None:
@@ -180,10 +169,12 @@ def build_app(server: OctopServer) -> FastAPI:
         acp,
         admin,
         agent_files,
+        agent_mcp,
         agent_tools,
         agents,
         auth,
         auth_ldap,
+        auth_mfa,
         auth_oauth,
         auth_oidc,
         backup,
@@ -191,13 +182,9 @@ def build_app(server: OctopServer) -> FastAPI:
         browser,
         channels,
         chat,
-        client_config,
-        communication,
-        company_runtime,
         connectors,
         cron,
         desktop,
-        devices,
         envs,
         experts,
         health,
@@ -209,6 +196,7 @@ def build_app(server: OctopServer) -> FastAPI:
         media_generation,
         memory,
         memory_portable,
+        memory_storage,
         mobile,
         ollama_models,
         onnx_models,
@@ -225,14 +213,17 @@ def build_app(server: OctopServer) -> FastAPI:
         subagents,
         teams,
         terminal,
+        text_assist,
         update,
         uploads,
         usage,
+        user_groups,
         user_roles,
         users,
         voice,
         workspace,
     )
+    from octop.api.routers.decision import router as decision_router
     from octop.api.routers.filesystem import router as filesystem_router
     from octop.api.routers.observability import router as observability_router
     from octop.api.routers.providers import admin_router as admin_providers_router
@@ -247,6 +238,7 @@ def build_app(server: OctopServer) -> FastAPI:
         [
             _RouterMount(setup.router, "/api", ["setup"]),
             _RouterMount(auth.router, "/api/auth", ["auth"]),
+            _RouterMount(auth_mfa.router, "/api/auth", ["auth"]),
             _RouterMount(auth_oidc.router, "/api/auth", ["auth"]),
             _RouterMount(auth_oauth.router, "/api/auth", ["auth"]),
             _RouterMount(auth_ldap.router, "/api/auth", ["auth"]),
@@ -256,21 +248,22 @@ def build_app(server: OctopServer) -> FastAPI:
             _RouterMount(health.router, "/api/health", ["health"]),
             _RouterMount(invites.admin_router, "/api/users/invites", ["users"]),
             _RouterMount(user_roles.router, "/api/users/roles", ["users"]),
+            _RouterMount(user_groups.router, "/api/user-groups", ["users"]),
             _RouterMount(users.router, "/api/users", ["users"]),
             _RouterMount(agents.router, "/api/agents", ["agents"]),
             _RouterMount(agent_tools.router, "/api", ["agents"]),
             _RouterMount(acp.router, "/api", ["agents"]),
+            _RouterMount(agent_mcp.router, "/api", ["agent-mcp"]),
             _RouterMount(chat.router, "/api", ["chat"]),
             _RouterMount(slash.router, "/api", ["slash"]),
             _RouterMount(connectors.router, "/api", ["connectors"]),
             _RouterMount(bridge.router, "/api", ["bridge"]),
-            _RouterMount(communication.router, "/api/im", ["communication"]),
             _RouterMount(knowledge_bases.router, "/api", ["knowledge"]),
             _RouterMount(internal_mcp.router, "/api", ["internal-mcp"]),
             _RouterMount(channels.router, "/api", ["channels"]),
             _RouterMount(cron.router, "/api", ["cron"]),
             _RouterMount(settings.router, "/api", ["settings"]),
-            _RouterMount(client_config.router, "/api", ["client-config"]),
+            _RouterMount(decision_router, "/api", ["settings"]),
             _RouterMount(envs.router, "/api", ["envs"]),
             _RouterMount(search.router, "/api", ["search"]),
             _RouterMount(providers.router, "/api/providers", ["providers"]),
@@ -295,10 +288,12 @@ def build_app(server: OctopServer) -> FastAPI:
             _RouterMount(mbti.router, "/api", ["mbti"]),
             _RouterMount(experts.router, "/api", ["experts"]),
             _RouterMount(teams.router, "/api", ["teams"]),
+            _RouterMount(text_assist.router, "/api", ["text-assist"]),
             _RouterMount(workspace.router, "/api", ["workspace"]),
             _RouterMount(agent_files.router, "/api", ["agent_files"]),
             _RouterMount(memory.router, "/api", ["memory"]),
             _RouterMount(memory_portable.router, "/api", ["memory"]),
+            _RouterMount(memory_storage.router, "/api", ["memory"]),
             _RouterMount(proactive_care.router, "/api", ["proactive-care"]),
             _RouterMount(usage.router, "/api", ["usage"]),
             _RouterMount(usage.admin_router, "/api/admin", ["admin"]),
@@ -307,8 +302,6 @@ def build_app(server: OctopServer) -> FastAPI:
             _RouterMount(subagents.router, "/api", ["subagents"]),
             _RouterMount(terminal.router, "/api", ["terminal"]),
             _RouterMount(uploads.router, "/api", ["chat"]),
-            _RouterMount(devices.router, "/api", ["devices"]),
-            _RouterMount(company_runtime.router, "/api", ["devices"]),
             _RouterMount(update.router, "/api", ["update"]),
             _RouterMount(browser.router, "/api", ["browser"]),
             _RouterMount(desktop.router, "/api", ["desktop"]),
@@ -341,42 +334,23 @@ def build_app(server: OctopServer) -> FastAPI:
         if index_file.exists():
 
             @app.get("/{full_path:path}", include_in_schema=False)
-            async def spa_fallback(request: Request, full_path: str) -> FileResponse:
+            async def spa_fallback(full_path: str) -> FileResponse:
                 if full_path.startswith(("api/", "ws/")):
                     raise HTTPException(status_code=404, detail="Not Found")
 
-                selected_dir = dashboard_directory(
-                    dashboard_dir,
-                    request.url.hostname,
-                    cfg.dashboard_cdn_hosts if cfg else (),
-                )
-                selected_index = selected_dir / "index.html"
-                public_edge_cache = selected_dir != dashboard_dir
                 if full_path:
                     raw_path = Path(full_path)
                     # Reject absolute paths and parent-dir references before
                     # joining, so user input never drives a path expression.
                     if raw_path.is_absolute() or ".." in raw_path.parts:
-                        return _dashboard_fallback(
-                            selected_index, full_path, public_edge_cache=public_edge_cache
-                        )
-                    candidate = (selected_dir / Path(*raw_path.parts)).resolve()
+                        return _dashboard_fallback(index_file, full_path)
+                    candidate = (dashboard_dir / Path(*raw_path.parts)).resolve()
                     try:
-                        candidate.relative_to(selected_dir.resolve())
+                        candidate.relative_to(dashboard_dir.resolve())
                     except ValueError:
-                        return _dashboard_fallback(
-                            selected_index, full_path, public_edge_cache=public_edge_cache
-                        )
+                        return _dashboard_fallback(index_file, full_path)
                     if candidate.is_file():
                         return _dashboard_response(candidate, full_path)
-                    # A previously cached shell can still reference local
-                    # hashes after the public host switches to the CDN build.
-                    if selected_dir != dashboard_dir and is_dashboard_asset_path(full_path):
-                        previous = (dashboard_dir / Path(*raw_path.parts)).resolve()
-                        if previous.is_relative_to(dashboard_dir.resolve()) and previous.is_file():
-                            return _dashboard_response(previous, full_path)
-                return _dashboard_fallback(
-                    selected_index, full_path, public_edge_cache=public_edge_cache
-                )
+                return _dashboard_fallback(index_file, full_path)
 
     return app

@@ -30,16 +30,17 @@ export function useDesktopChrome(): DesktopChromeStyle | null {
       setStyle(next);
       return true;
     };
-    window.addEventListener("octop:native-titlebar-ready", tryApply);
-    const applied = tryApply();
+    if (tryApply()) {
+      return () => {
+        cancelled = true;
+      };
+    }
     const timer = window.setInterval(() => {
       if (tryApply()) window.clearInterval(timer);
     }, 250);
-    if (applied) window.clearInterval(timer);
     const stop = window.setTimeout(() => window.clearInterval(timer), 12_000);
     return () => {
       cancelled = true;
-      window.removeEventListener("octop:native-titlebar-ready", tryApply);
       window.clearInterval(timer);
       window.clearTimeout(stop);
     };

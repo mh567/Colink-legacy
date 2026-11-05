@@ -1,8 +1,7 @@
 import type { ReactNode } from "react";
 import {
   Monitor,
-  Bot,
-  Building2,
+  MessageSquareText,
   Timer,
   SlidersHorizontal,
   Waypoints,
@@ -30,14 +29,28 @@ export const COLLAPSED_WIDTH = 56;
 const iconSize = 16;
 const iconStroke = 1.8;
 
+const PERSONALIZATION_NAV_TABS = [
+  { key: "skills", path: "/personalization/skills" },
+  { key: "subagents", path: "/personalization/subagents" },
+  { key: "tools", path: "/personalization/tools" },
+  { key: "agent_plugins", path: "/personalization/plugins" },
+  { key: "mbti", path: "/personalization/mbti" },
+  { key: "memory", path: "/personalization/memory" },
+] as const;
+
+function personalizationNavPath(user: OctopUser | null): string {
+  for (const tab of PERSONALIZATION_NAV_TABS) {
+    if (userCan(user, tab.key)) return tab.path;
+  }
+  return PERSONALIZATION_NAV_TABS[0].path;
+}
+
 export interface NavItem {
   key: string;
   path: string;
   icon: ReactNode;
   labelKey: string;
-  label?: string;
   badge?: string;
-  unread?: number;
 }
 
 export interface NavSection {
@@ -50,16 +63,13 @@ export interface NavSection {
   items: NavItem[];
 }
 
-/** Preference keys, including the retired messages key for saved-layout compatibility. */
+/** Every nav item key the sidebar can show. Keep in sync with `SIDEBAR_NAV_KEYS` in `octop.infra.users.preferences`. */
 export const SIDEBAR_NAV_KEYS = [
   "chat",
-  "messages",
-  "contacts",
   "experts",
   "tasks",
   "token-usage",
   "personalization",
-  "local-workspace",
   "channels",
   "connectors",
   "skill-packages",
@@ -114,7 +124,6 @@ export function navSectionLabel(
  */
 export const SIDEBAR_GROUPED_NAV_KEYS = [
   "personalization",
-  "local-workspace",
   "channels",
   "connectors",
   "skill-packages",
@@ -140,30 +149,16 @@ export function isGroupedNavKey(key: string): boolean {
 
 export function buildNavSections(
   user: OctopUser | null,
-  opts?: {
-    mobileEnabled?: boolean;
-    unread?: number;
-    companyName?: string;
-    desktopAvailable?: boolean;
-  },
+  opts?: { mobileEnabled?: boolean },
 ): NavSection[] {
-  const topItems: NavItem[] = [];
-  if (navAllowed(user, "contacts") || navAllowed(user, "messages")) {
-    topItems.push({
-      key: "contacts",
-      path: navAllowed(user, "contacts") ? "/contacts" : "/messages",
-      icon: <Building2 size={iconSize} strokeWidth={iconStroke} />,
-      labelKey: "nav.company",
-      label: opts?.companyName?.trim() || undefined,
-      unread: navAllowed(user, "messages") ? opts?.unread : undefined,
-    });
-  }
-  topItems.push({
-    key: "chat",
-    path: "/chat",
-    icon: <Bot size={iconSize} strokeWidth={iconStroke} />,
-    labelKey: "nav.chat",
-  });
+  const topItems: NavItem[] = [
+    {
+      key: "chat",
+      path: "/chat",
+      icon: <MessageSquareText size={iconSize} strokeWidth={iconStroke} />,
+      labelKey: "nav.chat",
+    },
+  ];
   if (navAllowed(user, "experts")) {
     topItems.push({
       key: "experts",
@@ -190,20 +185,13 @@ export function buildNavSections(
   }
   const sections: NavSection[] = [{ items: topItems }];
 
-  const settingsItems: NavItem[] = [
-    {
+  const settingsItems: NavItem[] = [];
+  if (navAllowed(user, "personalization")) {
+    settingsItems.push({
       key: "personalization",
-      path: "/personalization/skills",
+      path: personalizationNavPath(user),
       icon: <Sparkles size={iconSize} strokeWidth={iconStroke} />,
       labelKey: "nav.personalization",
-    },
-  ];
-  if (opts?.desktopAvailable) {
-    settingsItems.unshift({
-      key: "local-workspace",
-      path: "/settings/workspace",
-      icon: <HardDrive size={iconSize} strokeWidth={iconStroke} />,
-      labelKey: "devices.workspaceTitle",
     });
   }
   if (navAllowed(user, "channels")) {
@@ -238,14 +226,14 @@ export function buildNavSections(
       labelKey: "nav.knowledgeBases",
     });
   }
-  // User-scoped remote Octop links — always available (like personalization).
-  settingsItems.push({
-    key: "bridge",
-    path: "/bridge",
-    icon: <Cloudy size={iconSize} strokeWidth={iconStroke} />,
-    labelKey: "nav.bridge",
-    badge: "Beta",
-  });
+  if (navAllowed(user, "bridge")) {
+    settingsItems.push({
+      key: "bridge",
+      path: "/bridge",
+      icon: <Cloudy size={iconSize} strokeWidth={iconStroke} />,
+      labelKey: "nav.bridge",
+    });
+  }
   if (settingsItems.length > 0) {
     sections.push({
       id: "settings",

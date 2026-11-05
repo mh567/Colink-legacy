@@ -11,7 +11,6 @@ const AUTH_REMEMBER_PREF_KEY = "auth_remember_pref";
  * React tree calls ``preventDefault()`` to route to /login itself, which keeps
  * the SPA alive instead of tearing the document down mid-render.
  */
-export const AUTH_TOKEN_CHANGED_EVENT = "octop:auth-token-changed";
 export const UNAUTHORIZED_EVENT = "octop:unauthorized";
 /** Fired when an agent-scoped API request is forbidden. */
 export const FORBIDDEN_EVENT = "octop:forbidden";
@@ -81,8 +80,6 @@ export function setAuthToken(token: string, remember: boolean = true) {
     localStorage.removeItem(AUTH_TOKEN_KEY);
   }
   clearSetupRequired();
-  _redirectingToLogin = false;
-  window.dispatchEvent(new Event(AUTH_TOKEN_CHANGED_EVENT));
 }
 
 /** Get JWT token from localStorage or (session-only) sessionStorage. */
@@ -101,16 +98,12 @@ export function clearAuthToken() {
   sessionStorage.removeItem(AUTH_REMEMBER_PREF_KEY);
   localStorage.removeItem("octop:active-agent");
   setActiveAgentId(null);
-  window.dispatchEvent(new Event(AUTH_TOKEN_CHANGED_EVENT));
 }
 
 /** Persist a sliding-renewed access token from an API response, if present. */
-export function applyRenewedAccessToken(
-  response: Response,
-  requestToken: string,
-): void {
+export function applyRenewedAccessToken(response: Response): void {
   const renewed = response.headers.get(ACCESS_TOKEN_RESPONSE_HEADER);
-  if (renewed && requestToken && requestToken === getAuthToken()) {
+  if (renewed) {
     setAuthToken(renewed, !isSessionOnlyAuth());
   }
 }
@@ -307,12 +300,10 @@ function buildAuthHeaders(path: string): Record<string, string> {
   return headers;
 }
 
-function tokenFromHeaders(headers: HeadersInit): string {
-  const value = new Headers(headers).get("authorization") ?? "";
-  return /^Bearer /i.test(value) ? value.slice(7).trim() : "";
-}
-
 let _redirectingToLogin = false;
+
+/** 401 codes that mean this Octop session is no longer valid. */
+const SESSION_UNAUTHORIZED_CODES = new Set(["AUTH_FAILED", "TOKEN_EXPIRED"]);
 
 /**
  * Send the user to the login screen exactly once, no matter how many parallel
@@ -342,18 +333,36 @@ function handleUnauthorized(): void {
  * Handle 401 responses: clear token, redirect to login, and throw.
  * Shared by request(), requestBlob(), and requestUpload().
  */
+async function errorCodeOf(response: Response): Promise<string | undefined> {
+  try {
+    const body = (await response.clone().json()) as {
+      error?: { code?: string };
+    };
+    const code = body?.error?.code;
+    return typeof code === "string" && code.trim() ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function throwIfUnauthorized(
   path: string,
   response: Response,
-  requestToken: string,
 ): Promise<void> {
   if (response.status !== 401 || path.startsWith("/auth/")) {
     return;
   }
-  if (requestToken === getAuthToken()) {
-    clearAuthToken();
-    handleUnauthorized();
+  const code = await errorCodeOf(response);
+  // Business 401s (peer login, etc.) are not a dead local session.
+  if (
+    code &&
+    !SESSION_UNAUTHORIZED_CODES.has(code) &&
+    !path.startsWith("/setup/")
+  ) {
+    return;
   }
+  clearAuthToken();
+  handleUnauthorized();
   let message = "Unauthorized";
   if (path.startsWith("/setup/")) {
     try {
@@ -379,7 +388,6 @@ export async function request<T = unknown>(
   const url = getApiUrl(path);
 
   const headers = buildHeaders(path, options.headers);
-  const requestToken = tokenFromHeaders(headers);
 
   const response = await fetch(url, {
     ...options,
@@ -390,8 +398,8 @@ export async function request<T = unknown>(
     throw new SetupRequiredError();
   }
 
-  await throwIfUnauthorized(path, response, requestToken);
-  applyRenewedAccessToken(response, requestToken);
+  await throwIfUnauthorized(path, response);
+  applyRenewedAccessToken(response);
 
   if (!response.ok) {
     if (response.status === 403 && isAgentScopedPath(path)) {
@@ -434,22 +442,18 @@ export async function requestBlob(
   assertNotSetupLocked(path);
 
   const url = getApiUrl(path);
-  const headers = {
-    ...buildAuthHeaders(path),
-    ...(options.headers as Record<string, string>),
-  };
-  const requestToken = tokenFromHeaders(headers);
+  const headers = buildAuthHeaders(path);
   const response = await fetch(url, {
     ...options,
-    headers,
+    headers: { ...headers, ...(options.headers as Record<string, string>) },
   });
 
   if (await check503ForSetupRequired(path, response)) {
     throw new SetupRequiredError();
   }
 
-  await throwIfUnauthorized(path, response, requestToken);
-  applyRenewedAccessToken(response, requestToken);
+  await throwIfUnauthorized(path, response);
+  applyRenewedAccessToken(response);
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -491,22 +495,18 @@ export async function probeAuthResource(
   assertNotSetupLocked(path);
 
   const url = getApiUrl(path);
-  const headers = {
-    ...buildAuthHeaders(path),
-    ...(options.headers as Record<string, string>),
-  };
-  const requestToken = tokenFromHeaders(headers);
+  const headers = buildAuthHeaders(path);
   const response = await fetch(url, {
     ...options,
-    headers,
+    headers: { ...headers, ...(options.headers as Record<string, string>) },
   });
 
   if (await check503ForSetupRequired(path, response)) {
     throw new SetupRequiredError();
   }
 
-  await throwIfUnauthorized(path, response, requestToken);
-  applyRenewedAccessToken(response, requestToken);
+  await throwIfUnauthorized(path, response);
+  applyRenewedAccessToken(response);
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -535,22 +535,18 @@ export async function requestStream(
   assertNotSetupLocked(path);
 
   const url = getApiUrl(path);
-  const headers = {
-    ...buildAuthHeaders(path),
-    ...(options.headers as Record<string, string>),
-  };
-  const requestToken = tokenFromHeaders(headers);
+  const headers = buildAuthHeaders(path);
   const response = await fetch(url, {
     ...options,
-    headers,
+    headers: { ...headers, ...(options.headers as Record<string, string>) },
   });
 
   if (await check503ForSetupRequired(path, response)) {
     throw new SetupRequiredError();
   }
 
-  await throwIfUnauthorized(path, response, requestToken);
-  applyRenewedAccessToken(response, requestToken);
+  await throwIfUnauthorized(path, response);
+  applyRenewedAccessToken(response);
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -587,13 +583,6 @@ export async function requestUpload<T = unknown>(
 
   const url = getApiUrl(path);
   const headers = buildAuthHeaders(path);
-  const extraHeaders = new Headers(options.headers);
-  const requestToken = tokenFromHeaders({
-    ...headers,
-    ...(extraHeaders.has("authorization")
-      ? { Authorization: extraHeaders.get("authorization")! }
-      : {}),
-  });
   const method = options.method ?? "POST";
 
   return new Promise<T>((resolve, reject) => {
@@ -657,13 +646,13 @@ export async function requestUpload<T = unknown>(
         }
 
         try {
-          await throwIfUnauthorized(path, response, requestToken);
+          await throwIfUnauthorized(path, response);
         } catch (err) {
           reject(err);
           return;
         }
 
-        applyRenewedAccessToken(response, requestToken);
+        applyRenewedAccessToken(response);
 
         if (!response.ok) {
           // Same shape as request() so parseApiError() can read the error envelope.

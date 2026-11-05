@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Octop 企业版</title>
+    <title>Octop</title>
     <script>
       document.documentElement.dataset.chrome = /Mac|iPhone|iPad/.test(
         navigator.userAgent,
@@ -20,9 +20,6 @@
           "--window-controls-inset-end",
           "36px",
         );
-      } else if (navigator.userAgent.includes("OctopNativeTitlebar/1")) {
-        document.documentElement.dataset.chrome = "native";
-        document.documentElement.style.setProperty("--window-controls-inset-end", "0px");
       }
     </script>
     <script type="module" src="/wails/runtime.js"></script>
@@ -58,9 +55,6 @@
         background: var(--bg-layout);
         color: var(--text-primary);
         -webkit-font-smoothing: antialiased;
-      }
-      html[data-chrome="native"] .window-chrome {
-        display: none;
       }
       .window-chrome {
         position: fixed;
@@ -497,7 +491,7 @@
           alt="Octop"
           draggable="false"
         />
-        <p class="loading-brand" id="loading-brand">Octop 企业版</p>
+        <p class="loading-brand" id="loading-brand">Octop</p>
         <p class="loading-hint" id="loading-hint">
           正在检查运行环境，可能需要几分钟。
         </p>
@@ -506,14 +500,13 @@
             <span class="loading-bar-fill"></span>
           </div>
           <p class="loading-status" id="status">正在启动，请稍候…</p>
-          <button class="ghost" id="server-setup">服务器设置 / Server settings</button>
         </div>
       </div>
     </div>
 
     <div id="settings-panel" class="hidden">
       <div class="wrap">
-        <h1 id="title">Octop 企业版设置</h1>
+        <h1 id="title">Octop 设置</h1>
         <p class="subtitle" id="subtitle">桌面端偏好</p>
         <div class="card">
           <div class="row">
@@ -563,7 +556,6 @@
         </div>
         <div class="actions">
           <button class="primary" id="show-main">显示 Octop</button>
-          <button class="ghost" id="company-device">服务器 / Server</button>
           <button class="ghost" id="quit">退出</button>
         </div>
         <p class="status hidden" id="settings-status"></p>
@@ -574,10 +566,9 @@
 
       const copy = {
         zh: {
-          brand: "Octop 企业版",
           statusWait: "正在启动，请稍候…",
           loadingHint: "正在检查运行环境，可能需要几分钟。",
-          title: "Octop 企业版设置",
+          title: "Octop 设置",
           subtitle: "桌面端偏好",
           lang: "语言",
           langH: "选择偏好语言 / Choose your preferred language",
@@ -587,7 +578,7 @@
           trayH: "点击最小化时隐藏窗口并保留在系统托盘",
           sleep: "防止系统休眠",
           sleepH: "应用运行期间阻止系统自动休眠",
-          showMain: "显示 Octop 企业版",
+          showMain: "显示 Octop",
           quit: "退出",
           winGroup: "窗口控制",
           winMin: "最小化",
@@ -595,10 +586,9 @@
           winClose: "关闭",
         },
         en: {
-          brand: "Octop Enterprise",
           statusWait: "Starting, please wait…",
           loadingHint: "Checking the runtime. This may take a few minutes.",
-          title: "Octop Enterprise Settings",
+          title: "Octop Settings",
           subtitle: "Desktop preferences",
           lang: "Language",
           langH: "Choose your preferred language",
@@ -608,7 +598,7 @@
           trayH: "Hide the window on minimize and keep Octop in the tray",
           sleep: "Prevent system sleep",
           sleepH: "Keeps the system awake while Octop is running",
-          showMain: "Show Octop Enterprise",
+          showMain: "Show Octop",
           quit: "Quit",
           winGroup: "Window controls",
           winMin: "Minimize",
@@ -632,9 +622,6 @@
 
       function applyCopy(locale) {
         const t = copy[locale] || copy.en;
-        document.title = t.brand;
-        document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
-        document.getElementById("loading-brand").textContent = t.brand;
         document.getElementById("title").textContent = t.title;
         document.getElementById("subtitle").textContent = t.subtitle;
         document.getElementById("l-lang").textContent = t.lang;
@@ -677,9 +664,6 @@
       async function call(name, ...args) {
         return Call.ByName("main.App." + name, ...args);
       }
-
-      document.getElementById("company-device").onclick = () => call("ShowCompany");
-      document.getElementById("server-setup").onclick = () => call("ShowCompany");
 
       const MASCOT_IMAGES = [
         "/octop-mascot-peek.webp",

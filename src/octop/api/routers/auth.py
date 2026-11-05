@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from octop.api.common.client_ip import resolve_client_ip
-from octop.api.deps import _decode, current_user, extract_raw_token, get_server, sign_token
+from octop.api.deps import ACCESS_TOKEN_RESPONSE_HEADER, current_user, get_server
 from octop.infra.auth.captcha import current_env, ensure_captcha, load_effective, public_config
-from octop.infra.auth.tokens import session_id
+from octop.infra.auth.mfa import MfaService
 from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.users.email import normalize_email
 from octop.infra.users.permissions import effective_permissions
@@ -55,7 +54,7 @@ def me_payload(user: Any, server: Any) -> dict[str, Any]:
 
     payload["avatar_icon"] = row.avatar_icon
     payload["avatar_url"] = profile_avatar_url(
-        server.services.paths.user_avatars_dir,
+        server.services.avatars("user"),
         str(user.id),
         f"/api/users/{user.id}/avatar",
     )
@@ -155,7 +154,7 @@ async def _authenticate_ldap(server: Any, username: str, password: str, client_i
         _raise_if_throttled(retry_after)
         return None
     throttle.clear(username, client_ip)
-    return await service.resolve_user(identity)
+    return await service.resolve_user(identity, login_name=username)
 
 
 def _raise_if_throttled(retry_after: int) -> None:
@@ -191,16 +190,20 @@ async def login(
     )
     client_ip = _client_ip(request)
     await ensure_captcha(effective, body.captcha_token, client_ip)
+    amr: Literal["password", "ldap"] = "password"
     user = await server.user_manager.authenticate(body.username, body.password)
     if user is None:
         local_row = _local_row(server, body.username)
         if _directory_may_own(local_row):
             user = await _authenticate_ldap(server, body.username, body.password, client_ip)
+            if user is not None:
+                amr = "ldap"
     if user is None:
         raise OctopError(ErrorCode.AUTH_FAILED, "invalid credentials")
-    secret = server.services.secret_repo.get("jwt")
-    ttl = server.services.config.access_token_ttl_seconds
-    token = sign_token(secret, sub=user.id, uname=user.username, role=user.role, ttl_seconds=ttl)
+    mfa = MfaService(server.services)
+    if mfa.has_verified_factor(user.id):
+        return mfa.issue_mfa_challenge(user, amr=amr)
+    token, ttl = mfa.mint_access_token(user)
     return {
         "access_token": token,
         "token_type": "Bearer",
@@ -210,27 +213,8 @@ async def login(
 
 
 @router.post("/logout", status_code=204, summary="Sign out")
-async def logout(
-    request: Request, user: Any = Depends(current_user), server: Any = Depends(get_server)
-) -> Response:
-    """Revoke this login session, including renewed tokens and realtime tickets."""
-    raw = extract_raw_token(
-        authorization=request.headers.get("authorization"),
-        access_token=request.query_params.get("access_token"),
-    )
-    if not raw:
-        raise OctopError(ErrorCode.AUTH_FAILED, "missing credentials")
-    claims = _decode(server, raw)
-    session = session_id(raw, claims)
-    # Another tab may already hold a renewed token with the same session id.
-    expires = max(
-        int(claims["exp"]), int(time.time()) + server.services.config.access_token_ttl_seconds
-    )
-    await asyncio.to_thread(
-        server.services.communication_identity_repo.revoke_session, session, expires
-    )
-    if server.devices is not None:
-        await server.devices.revoke_session(session)
+async def logout(user: Any = Depends(current_user), server: Any = Depends(get_server)) -> Response:
+    """Record an audit event for the current session. JWTs are stateless and not revoked server-side."""
     server.services.audit_repo.write(actor=user.username, action="auth.logout")
     return Response(status_code=204)
 
@@ -249,9 +233,16 @@ async def change_password(
     user: Any = Depends(current_user),
     server: Any = Depends(get_server),
 ) -> Response:
-    """Verify the old password and set a new one for the current user."""
+    """Verify the old password and set a new one for the current user.
+
+    Previously issued access tokens stop working. This response carries a
+    replacement in ``X-Octop-Access-Token`` so the current client stays signed in.
+    """
     await server.user_manager.change_password(user.username, body.old_password, body.new_password)
-    return Response(status_code=204)
+    token, _ttl = MfaService(server.services).mint_access_token(user)
+    response = Response(status_code=204)
+    response.headers[ACCESS_TOKEN_RESPONSE_HEADER] = token
+    return response
 
 
 class UpdateMeBody(BaseModel):
@@ -278,15 +269,10 @@ async def update_me(
     if "locale" in provided:
         await server.user_manager.set_locale(user.username, body.locale)
     if "avatar_icon" in provided:
-        from octop.infra.users.profile_avatar import (
-            clean_avatar_icon,
-            delete_profile_avatar,
-            notify_user_avatar_changed,
-        )
+        from octop.infra.users.profile_avatar import clean_avatar_icon, delete_profile_avatar
 
         server.services.user_repo.set_avatar_icon(user.id, clean_avatar_icon(body.avatar_icon))
-        delete_profile_avatar(server.services.paths.user_avatars_dir, str(user.id))
-        await notify_user_avatar_changed(server.services, user.id)
+        delete_profile_avatar(server.services.avatars("user"), str(user.id))
     updated = server.user_manager.get(user.username)
     assert updated is not None
     return me_payload(updated, server)
@@ -298,21 +284,16 @@ async def upload_my_avatar(
     user: Any = Depends(current_user),
     server: Any = Depends(get_server),
 ) -> dict[str, str | None]:
-    from octop.infra.users.profile_avatar import (
-        notify_user_avatar_changed,
-        profile_avatar_url,
-        write_profile_avatar,
-    )
+    from octop.infra.users.profile_avatar import profile_avatar_url, write_profile_avatar
 
     write_profile_avatar(
-        server.services.paths.user_avatars_dir,
+        server.services.avatars("user"),
         str(user.id),
         await file.read(),
     )
-    await notify_user_avatar_changed(server.services, user.id)
     return {
         "avatar_url": profile_avatar_url(
-            server.services.paths.user_avatars_dir,
+            server.services.avatars("user"),
             str(user.id),
             f"/api/users/{user.id}/avatar",
         )
@@ -324,8 +305,7 @@ async def delete_my_avatar(
     user: Any = Depends(current_user),
     server: Any = Depends(get_server),
 ) -> Response:
-    from octop.infra.users.profile_avatar import delete_profile_avatar, notify_user_avatar_changed
+    from octop.infra.users.profile_avatar import delete_profile_avatar
 
-    delete_profile_avatar(server.services.paths.user_avatars_dir, str(user.id))
-    await notify_user_avatar_changed(server.services, user.id)
+    delete_profile_avatar(server.services.avatars("user"), str(user.id))
     return Response(status_code=204)

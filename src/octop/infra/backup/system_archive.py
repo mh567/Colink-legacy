@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import logging
@@ -20,7 +19,6 @@ from octop.infra.agents.workspace.dir import (
     system_files_path_from_config,
     workspace_dir_from_config_json,
 )
-from octop.infra.backend.isolation import isolation_enabled
 from octop.infra.backup.chats import (
     CHAT_TABLES_CHILD_FIRST,
     capture_chat_tables,
@@ -57,7 +55,6 @@ _WORKSPACES_DIR = "workspaces"
 _SKILL_PACKAGES_DIR = "skill-packages"
 _PLUGINS_DIR = "plugins"
 _KNOWLEDGE_DIR = "knowledge"
-_COMPANY_SKILLS_DIR = "company-runtime-skills"
 _MANIFEST_NAME = "manifest.json"
 _SQLITE_DB_ARC = f"{_DB_DIR}/octop.db"
 _PG_DUMP_ARC = f"{_DB_DIR}/octop.dump"
@@ -164,7 +161,7 @@ def _build_manifest(
         AgentBackupEntry(
             agent_id=str(row.agent_id),
             name=str(row.name),
-            workspace_included=include_workspaces and not isolation_enabled(),
+            workspace_included=include_workspaces,
         )
         for row in agent_rows
     ]
@@ -184,14 +181,6 @@ def _build_manifest(
         includes_plugins=include_plugins,
         includes_knowledge=include_knowledge,
         includes_chats=include_chats,
-        includes_company_runtime_skills=(paths.root / _COMPANY_SKILLS_DIR).is_dir(),
-        external_components=["desktop_projects", "external_secrets"]
-        + (["sandbox_volumes"] if isolation_enabled() else [])
-        + (
-            ["communication_database", "communication_media"]
-            if os.environ.get("OCTOP_IM_URL")
-            else []
-        ),
     )
 
 
@@ -305,7 +294,7 @@ def create_system_backup(
                     )
                 if include_config and env_path.is_file():
                     tf.add(root / _CONFIG_DIR / "env", arcname=f"{_CONFIG_DIR}/env")
-                if include_workspaces and not isolation_enabled():
+                if include_workspaces:
                     for row in agent_rows:
                         agent_id = str(row.agent_id)
                         try:
@@ -330,10 +319,6 @@ def create_system_backup(
                                 agent_id,
                                 exc_info=True,
                             )
-                if manifest.includes_company_runtime_skills:
-                    _add_dir(
-                        tf, paths.root / _COMPANY_SKILLS_DIR, _COMPANY_SKILLS_DIR, skip_chats=False
-                    )
                 if include_skill_packages and paths.skill_packages_dir.is_dir():
                     _add_dir(
                         tf,
@@ -506,13 +491,6 @@ def restore_system_backup(
         if not db_path.is_file():
             raise OctopError(ErrorCode.SLASH_BAD_ARGS, "backup archive missing database file")
 
-        # Validate immutable skill contents before replacing any database state.
-        if manifest.includes_company_runtime_skills:
-            for relative, item in _iter_extracted_files(extracted, _COMPANY_SKILLS_DIR):
-                with item.open("rb") as stream:
-                    if Path(relative).name != hashlib.file_digest(stream, "sha256").hexdigest():
-                        raise OctopError(ErrorCode.SLASH_BAD_ARGS, "invalid company skill digest")
-
         saved_chats = (
             capture_chat_tables(pool, Path(tmp) / "preserved-chats.sqlite")
             if not manifest.includes_chats
@@ -652,17 +630,6 @@ def restore_system_backup(
                 _KNOWLEDGE_DIR,
             )
 
-        # Merge content-addressed skills: preserved live task snapshots may still
-        # reference existing hashes when this archive omitted chat history.
-        restored_company_skill_files = 0
-        if manifest.includes_company_runtime_skills:
-            from octop.infra.company_runtime.skills import store_asset
-
-            for _relative, item in _iter_extracted_files(extracted, _COMPANY_SKILLS_DIR):
-                data = item.read_bytes()
-                store_asset(paths.root / _COMPANY_SKILLS_DIR, data)
-                restored_company_skill_files += 1
-
         preserved_chat_rows, skipped_chat_rows = (
             restore_preserved_chats(pool, saved_chats) if saved_chats is not None else (0, 0)
         )
@@ -676,8 +643,6 @@ def restore_system_backup(
         "skill_package_files": restored_skill_package_files,
         "plugin_files": restored_plugin_files,
         "knowledge_files": restored_knowledge_files,
-        "company_skill_files": restored_company_skill_files,
-        "external_components": manifest.external_components,
         "restore_config": restore_config,
         "chats_restored": manifest.includes_chats,
         "preserved_chat_rows": preserved_chat_rows,

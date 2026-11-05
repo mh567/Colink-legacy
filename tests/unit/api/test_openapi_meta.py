@@ -27,12 +27,5 @@ async def test_openapi_has_bearer_security_and_descriptions(tmp_octop_home: Path
         me = spec["paths"]["/api/auth/me"]["get"]
         assert "BearerAuth" in me["security"][0]
         assert "security" not in spec["paths"]["/api/setup/status"]["get"]
-        messaging = spec["paths"]["/api/im/conversations/{id}/messages"]["post"]
-        assert messaging["summary"] == "Send a text or image message"
-        assert (
-            "client_message_id"
-            in messaging["requestBody"]["content"]["application/json"]["schema"]["properties"]
-        )
-        assert spec["paths"]["/api/im/media/{id}"]["get"]["summary"]
     finally:
         await srv.stop()

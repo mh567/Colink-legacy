@@ -30,11 +30,14 @@ export function needsAuthBlobFetch(url: string): boolean {
     ? new URL(url).pathname
     : url.split("?")[0];
   if (path === "/api/workspace/media") return true;
-  if (/^\/api\/im\/media\/[^/]+$/.test(path)) return true;
   // Bridge agent ids contain ``:`` (or ``%3A``); ``[^/]+`` still matches.
   if (/^\/api\/agents\/[^/]+\/avatar$/.test(path)) return true;
   if (/^\/api\/users\/\d+\/avatar$/.test(path)) return true;
   if (/^\/api\/users\/roles\/[^/]+\/avatar$/.test(path)) return true;
+  if (/^\/api\/user-groups\/[^/]+\/avatar$/.test(path)) return true;
+  if (/^\/api\/skill-packages\/[^/]+\/avatar$/.test(path)) return true;
+  if (/^\/api\/knowledge-bases\/[^/]+\/avatar$/.test(path)) return true;
+  if (/^\/api\/bridge\/connections\/[^/]+\/avatar$/.test(path)) return true;
   if (/^\/api\/experts\/published\/[^/]+\/avatar$/.test(path)) return true;
   if (/^\/api\/agents\/[^/]+\/media\/preview$/.test(path)) return true;
   if (/^\/api\/agents\/[^/]+\/workspace\/download$/.test(path)) return true;
@@ -765,34 +768,11 @@ function withCanonicalUrls(
   }));
 }
 
-/** Compare file identities without changing the URL used to fetch the file. */
-function mediaIdentity(url: string): string {
-  try {
-    const parsed = new URL(url, "http://octop.local");
-    const route = parsed.pathname.match(
-      /^\/api\/agents\/([^/]+)\/(?:media\/preview|workspace\/download)$/,
-    );
-    const source =
-      parsed.searchParams.get("source") ?? parsed.searchParams.get("path");
-    if (!route || !source) return url;
-    const agentId = decodeURIComponent(route[1]);
-    let path = source.replace(/\\/g, "/").replace(/^file:\/\//i, "");
-    const marker = `/.octop/agents/${agentId}/`;
-    const offset = path.indexOf(marker);
-    if (offset >= 0) path = path.slice(offset + marker.length);
-    else if (!isHostAbsolutePath(path)) path = path.replace(/^\.\//, "");
-    return JSON.stringify([agentId, path]);
-  } catch {
-    return url;
-  }
-}
-
-export function dedupeToolMedia<T extends { url: string }>(items: T[]): T[] {
+function dedupeByUrl<T extends { url: string }>(items: T[]): T[] {
   const seen = new Set<string>();
   return items.filter((item) => {
-    const identity = mediaIdentity(item.url);
-    if (seen.has(identity)) return false;
-    seen.add(identity);
+    if (seen.has(item.url)) return false;
+    seen.add(item.url);
     return true;
   });
 }
@@ -888,9 +868,9 @@ export function collectToolMediaFromToolData(
   }
 
   return {
-    images: dedupeToolMedia(withCanonicalUrls(images, agentId)),
-    videos: dedupeToolMedia(withCanonicalUrls(videos, agentId)),
-    files: dedupeToolMedia(
+    images: withCanonicalUrls(dedupeByUrl(images), agentId),
+    videos: withCanonicalUrls(dedupeByUrl(videos), agentId),
+    files: dedupeByUrl(
       files.map((file) => ({
         ...file,
         url: agentId ? canonicalizeMediaApiUrl(file.url, agentId) : file.url,

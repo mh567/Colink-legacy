@@ -17,28 +17,20 @@ const (
 
 // Settings is persisted at ~/.octop/desktop-settings.json
 type Settings struct {
-	Locale          Locale `json:"locale"`
-	Autostart       bool   `json:"autostart"`
-	MinimizeToTray  bool   `json:"minimizeToTray"`
-	PreventSleep    bool   `json:"preventSleep"`
-	Port            int    `json:"port,omitempty"`
-	ConnectionMode  string `json:"connectionMode,omitempty"`
-	CompanyURL      string `json:"companyUrl,omitempty"`
-	CompanyRemember bool   `json:"companyRemember,omitempty"`
+	Locale         Locale `json:"locale"`
+	Autostart      bool   `json:"autostart"`
+	MinimizeToTray bool   `json:"minimizeToTray"`
+	PreventSleep   bool   `json:"preventSleep"`
+	Port           int    `json:"port,omitempty"`
 }
 
 func defaultSettings() Settings {
-	locale := LocaleEN
-	if companyOnly {
-		locale = LocaleZH
-	}
 	return Settings{
-		Locale:         locale,
+		Locale:         LocaleEN,
 		Autostart:      false,
 		MinimizeToTray: true,
 		PreventSleep:   false,
 		Port:           8088,
-		ConnectionMode: "company",
 	}
 }
 
@@ -74,17 +66,9 @@ func loadSettings() Settings {
 	}
 	_ = json.Unmarshal(data, &s)
 	var legacy struct {
-		PreventSleepMac bool    `json:"preventSleepMac"`
-		ConnectionMode  *string `json:"connectionMode"`
+		PreventSleepMac bool `json:"preventSleepMac"`
 	}
 	_ = json.Unmarshal(data, &legacy)
-	// Preserve independent mode only for files written before the connection UI.
-	if legacy.ConnectionMode == nil {
-		s.ConnectionMode = "local"
-		if companyServerURL(s) != "" {
-			s.ConnectionMode = "company"
-		}
-	}
 	if !s.PreventSleep {
 		s.PreventSleep = legacy.PreventSleepMac
 	}
@@ -106,40 +90,6 @@ func (st *settingsStore) get() Settings {
 func (st *settingsStore) save(next Settings) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	// Ordinary preference bindings cannot change the trusted server target.
-	next.ConnectionMode, next.CompanyURL = st.cur.ConnectionMode, st.cur.CompanyURL
-	next.CompanyRemember = st.cur.CompanyRemember
-	return st.saveLocked(next)
-}
-
-func (st *settingsStore) saveLocale(locale Locale) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	next := st.cur
-	next.Locale = locale
-	return st.saveLocked(next)
-}
-
-func (st *settingsStore) saveConnection(mode, base string) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	next := st.cur
-	if next.CompanyURL != base {
-		next.CompanyRemember = false
-	}
-	next.ConnectionMode, next.CompanyURL = mode, base
-	return st.saveLocked(next)
-}
-
-func (st *settingsStore) saveCompanyRemember(remember bool) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	next := st.cur
-	next.CompanyRemember = remember
-	return st.saveLocked(next)
-}
-
-func (st *settingsStore) saveLocked(next Settings) error {
 	if next.Port == 0 {
 		next.Port = 8088
 	}

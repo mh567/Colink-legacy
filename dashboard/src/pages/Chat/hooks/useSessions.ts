@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { useTranslation } from "react-i18next";
+import { deleteConversation } from "../utils/deleteConversation";
 import {
   normalizeThreadArtifacts,
   octopThreadsApi,
@@ -18,10 +20,6 @@ export interface Session {
   channelType: string;
   isActive?: boolean;
   hasActivity?: boolean;
-  hasMessages?: boolean;
-  executionLocation?: "desktop" | "server";
-  localDeviceId?: string | null;
-  localTaskStatus?: string | null;
   pinned?: boolean;
   modelRef?: string | null;
   reasoningMode?: "auto" | "enabled" | "disabled" | null;
@@ -45,9 +43,6 @@ export function toSession(row: {
   channel_type?: string;
   is_active?: boolean;
   has_messages?: boolean;
-  execution_location?: "desktop" | "server";
-  local_device_id?: string | null;
-  local_task_status?: string | null;
   pinned?: boolean;
   model_ref?: string | null;
   reasoning_mode?: "auto" | "enabled" | "disabled" | null;
@@ -78,10 +73,6 @@ export function toSession(row: {
     channelType: row.channel_type ?? "dashboard",
     isActive: row.is_active ?? false,
     hasActivity,
-    hasMessages: row.has_messages,
-    executionLocation: row.execution_location,
-    localDeviceId: row.local_device_id,
-    localTaskStatus: row.local_task_status,
     pinned: Boolean(row.pinned),
     modelRef: row.model_ref ?? null,
     reasoningMode: row.reasoning_mode ?? null,
@@ -398,6 +389,7 @@ export function resetSessionStoreForTests() {
 }
 
 export function useSessions(agentId: string | null) {
+  const { t } = useTranslation();
   syncStoreToAgent(agentId);
   const { sessions, loading, hasMore, loadingMore } = useSyncExternalStore(
     subscribeSessionStore,
@@ -526,6 +518,32 @@ export function useSessions(agentId: string | null) {
 
   useEffect(() => {
     return onSessionEvent((event) => {
+      if (event.kind === "sessionRenamed") {
+        const title = formatThreadTitle(event.title);
+        if (!title) return;
+        if (event.agentId && event.agentId !== _storeAgentId) return;
+        setModuleSessions((prev) => {
+          const hasId = prev.some((session) => session.id === event.sessionId);
+          return prev.map((session) => {
+            const matches =
+              session.id === event.sessionId ||
+              (Boolean(event.agentId) &&
+                event.agentId === _storeAgentId &&
+                !hasId &&
+                session.id === "__pending__");
+            if (!matches) return session;
+            if (
+              event.provisional &&
+              session.name &&
+              session.name !== "New Chat"
+            ) {
+              return session;
+            }
+            return { ...session, name: title };
+          });
+        });
+        return;
+      }
       if (event.kind !== "sessionDeleted") return;
       const { sessionId } = event;
       setModuleSessions((prev) => prev.filter((s) => s.id !== sessionId));
@@ -584,19 +602,16 @@ export function useSessions(agentId: string | null) {
   }, [agentId]);
 
   const deleteSession = useCallback(
-    async (id: string) => {
+    async (id: string, compact: boolean) => {
       if (!agentId || !id) return false;
-      try {
-        await octopThreadsApi.delete(agentId, id);
-        setModuleSessions((prev) => prev.filter((s) => s.id !== id));
-        chatStore.removeSession(id);
-        chatStore.emitSessionEvent({ kind: "sessionDeleted", sessionId: id });
-        return true;
-      } catch {
-        return false;
-      }
+      const deleted = await deleteConversation(agentId, id, compact, t);
+      if (deleted !== true) return deleted;
+      setModuleSessions((prev) => prev.filter((s) => s.id !== id));
+      chatStore.removeSession(id);
+      chatStore.emitSessionEvent({ kind: "sessionDeleted", sessionId: id });
+      return true;
     },
-    [agentId],
+    [agentId, t],
   );
 
   const pinSession = useCallback(

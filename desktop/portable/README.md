@@ -1,12 +1,24 @@
 # Octop 绿色便携包（多平台）
 
-> 本目录构建独立运行服务端的基础模式便携包，不是企业员工客户端。企业客户端的本机执行、登录与安装包构建见[桌面说明](../README.md)；企业服务器部署见[部署指南](../../docker/enterprise/README.md)。
-
 解压即用：内置便携 CPython + Octop 及依赖，通过 `start.sh` / `start.bat` 启动。  
 **不依赖**系统 Python，也**不包含** Wails / 桌面壳——用浏览器打开 Dashboard。  
-首次启动通过设置向导创建管理员账号。
+首启走上游正常 setup wizard（本目录**不含** OOB / UI 裁剪）。
 
-## 依赖与校验
+## 与上游解耦
+
+本能力全部落在：
+
+- `desktop/portable/**`（脚本 / 模板 / 本目录 Makefile）
+- `.github/workflows/octop-desktop.yml`（多平台 CI）
+- `desktop/portable/.gitignore`（`/release/` `/runtimes/` `/wheels/` 等忽略构建产物）
+- `tests/unit/test_green_launch.py`（launch.py PATH / addsitedir）
+
+**不修改** `src/`、`dashboard/`、`pyproject.toml`、`uv.lock`、根 `Makefile`。  
+合并上游时只需留意上述路径；日常用：
+
+```bash
+make -f desktop/portable/Makefile green
+```
 
 依赖版本必须以仓库根目录 `uv.lock` 为准：`package.sh` 使用
 `uv export --frozen`，出包后跑 `desktop/portable/verify_imports.py`
@@ -17,7 +29,7 @@
 
 ## 产物布局
 
-文件名：`Octop-portable-<plat>-<version>.zip`。zip 内目录结构：
+公开文件名：`Octop-portable-<plat>-<version>.zip`。zip 内目录仍是：
 
 ```
 Octop-<plat>/
@@ -41,7 +53,7 @@ Octop-<plat>/
 make -f desktop/portable/Makefile green
 
 # 或分步：
-make build-frontend
+make build-frontend                  # 上游已有目标
 bash desktop/portable/bootstrap-runtime.sh
 bash desktop/portable/package.sh
 ```
@@ -73,7 +85,7 @@ OCTOP_GREEN_OFFLINE=1 bash desktop/portable/package.sh
 
 锁定的 `cryptography` 49.x **不再发布** macOS x86_64 / universal2 wheel。若允许从 sdist 编译，会链到构建机 Homebrew 的 `/usr/local/opt/openssl@3`，用户机缺库即启动失败。
 
-打包脚本执行以下依赖配置与检查：
+绿包脚本已做：
 
 1. `darwin-amd64` 覆盖钉死 `cryptography==46.0.3`（仍有 `macosx_*_universal2` wheel）
 2. 全平台 `--only-binary cryptography`，禁止源码编译
@@ -94,12 +106,13 @@ OCTOP_GREEN_OFFLINE=1 bash desktop/portable/package.sh
 
 ## CI
 
-上游工作流描述了以下六个平台的 zip 构建：
+[`.github/workflows/octop-desktop.yml`](../../.github/workflows/octop-desktop.yml) 在 6 个 runner 上出 zip：
 
 `linux-amd64` `linux-arm64` `darwin-arm64` `darwin-amd64` `windows-amd64` `windows-arm64`
 
-公开源码将该工作流归档为 `.github/upstream-workflows/octop-desktop.yml.disabled`，不会因标签或 PR 自动运行。重新启用前需适配本项目的发布目标和权限。原工作流使用 GitHub 上游 PBS（`PBS_BASE_URL`），本机构建默认 npmmirror。
+Actions 使用 GitHub 上游 PBS（`PBS_BASE_URL`），本机构建默认 npmmirror。产物以 `archive: false` 上传，避免 zip-in-zip。
 
-## 桌面壳
+## Electron 壳
 
-当前桌面客户端使用 Wails，构建入口见[桌面说明](../README.md)。基础模式壳消费 `Octop-portable-<plat>-<version>.zip`；企业员工安装包使用单独验证的企业工具 payload，由 `desktop/package-company.py` 打包，不能以基础绿色包代替。
+壳只消费 `Octop-portable-<plat>-<version>.zip`（zip 内仍是 `Octop-<plat>/`），不要把绿包编进 asar。步骤见
+[`AGENT_ELECTRON_INTEGRATION.md`](AGENT_ELECTRON_INTEGRATION.md)。

@@ -2,10 +2,10 @@ import { Layout } from "antd";
 import { Menu as MenuIcon } from "lucide-react";
 import PwaInstallPrompt from "../components/PwaInstallPrompt";
 import AppVersionBadge from "../components/AppVersionBadge";
-import EnterpriseBadge from "../components/EnterpriseBadge";
-import { useTranslation } from "react-i18next";
+import CurrentVersionBadge from "../components/CurrentVersionBadge";
 import { useTheme } from "../context/ThemeContext";
 import { typeSize } from "../utils/mobileTypeScale";
+import { publicUrl } from "../utils/publicUrl";
 
 const { Header: AntHeader } = Layout;
 
@@ -21,11 +21,10 @@ interface HeaderProps {
  * Desktop GitHub / theme controls moved into the account popover.
  */
 export default function Header({ onToggle, isMobile }: HeaderProps) {
-  const { t } = useTranslation();
   const { isDark } = useTheme();
   const mobileLogoSrc = isDark
-    ? "/logo_horizontal_white.png"
-    : "/logo_horizontal_dark.png";
+    ? publicUrl("logo_horizontal_white.png")
+    : publicUrl("logo_horizontal_dark.png");
 
   if (!isMobile) return null;
 
@@ -81,7 +80,7 @@ export default function Header({ onToggle, isMobile }: HeaderProps) {
         )}
         <img
           src={mobileLogoSrc}
-          alt={t("app.productName")}
+          alt="octop"
           style={{
             height: 36,
             width: "auto",
@@ -100,7 +99,7 @@ export default function Header({ onToggle, isMobile }: HeaderProps) {
             flexShrink: 1,
           }}
         >
-          <EnterpriseBadge isMobile />
+          <CurrentVersionBadge isMobile />
           <AppVersionBadge isMobile />
         </div>
       </div>

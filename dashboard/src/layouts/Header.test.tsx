@@ -13,6 +13,10 @@ vi.mock("../components/AppVersionBadge", () => ({
   default: () => null,
 }));
 
+vi.mock("../components/CurrentVersionBadge", () => ({
+  default: () => null,
+}));
+
 import Header from "./Header";
 
 describe("Header", () => {

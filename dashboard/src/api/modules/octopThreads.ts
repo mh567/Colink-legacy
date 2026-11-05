@@ -51,9 +51,6 @@ export interface OctopThread {
   created_at: number;
   is_active?: boolean;
   has_messages?: boolean;
-  execution_location?: "desktop" | "server";
-  local_device_id?: string | null;
-  local_task_status?: string | null;
   pinned?: boolean;
   unread_count?: number;
   model_ref?: string | null;
@@ -73,11 +70,6 @@ export interface OctopThread {
 }
 
 export interface OctopThreadHistory {
-  local_artifact_turns?: import("../desktopRuntime").LocalArtifactTurn[];
-  local_artifacts?: import("../desktopRuntime").LocalArtifact[];
-  execution_location?: "desktop" | "server";
-  local_device_id?: string | null;
-  local_task_status?: string | null;
   thread_id: string;
   messages: Array<{
     role: string;
@@ -89,6 +81,7 @@ export interface OctopThreadHistory {
     error_code?: string;
     agent_id?: string;
     team_wrapup?: boolean;
+    decision?: unknown;
   }>;
   pinned?: boolean;
   model_ref?: string | null;
@@ -115,6 +108,12 @@ export interface OctopThreadHistory {
   artifact_refs?: ThreadArtifact[];
 }
 
+/** Result of deleting a thread when the client asks about compaction. */
+export interface ThreadDeleteResult {
+  compacted?: boolean;
+  scheduled?: boolean;
+}
+
 export interface OctopThreadPatch {
   title?: string;
   pinned?: boolean;
@@ -132,8 +131,7 @@ export type ContextUsageSegmentKey =
   | "skills"
   | "mcp"
   | "subagent_definitions"
-  | "conversation"
-  | "unclassified";
+  | "conversation";
 
 export interface ContextUsageSegment {
   key: ContextUsageSegmentKey;
@@ -144,6 +142,8 @@ export interface ContextUsageBreakdown {
   max_tokens: number;
   used_tokens: number;
   segments: ContextUsageSegment[];
+  /** Tokens the decision filter kept out of the latest model request. */
+  decision_saved?: number;
 }
 
 export interface HistoryMigrationStatus {
@@ -170,14 +170,6 @@ export const octopThreadsApi = {
     request<{ thread_id: string; session_key: string }>(
       `/agents/${encodeURIComponent(agentId)}/threads`,
       { method: "POST" },
-    ),
-
-  cancel: (agentId: string, threadId: string, signal?: AbortSignal) =>
-    request<{ thread_id: string; requested: boolean }>(
-      `/agents/${encodeURIComponent(agentId)}/threads/${encodeURIComponent(
-        threadId,
-      )}/cancel`,
-      { method: "POST", signal },
     ),
 
   historyMigrationStatus: (agentId: string) =>
@@ -259,11 +251,11 @@ export const octopThreadsApi = {
       { method: "PATCH", body: JSON.stringify(body) },
     ),
 
-  delete: (agentId: string, threadId: string) =>
-    request<void>(
+  delete: (agentId: string, threadId: string, compact: boolean) =>
+    request<ThreadDeleteResult>(
       `/agents/${encodeURIComponent(agentId)}/threads/${encodeURIComponent(
         threadId,
-      )}`,
+      )}?compact=${compact ? "true" : "false"}`,
       { method: "DELETE" },
     ),
 

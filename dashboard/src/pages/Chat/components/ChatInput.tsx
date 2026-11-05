@@ -1,4 +1,3 @@
-import type { ContextUsageBreakdown } from "../../../api/modules/octopThreads";
 import {
   useState,
   useRef,
@@ -10,6 +9,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { App } from "antd";
+import cx from "classnames";
 
 import { useIsMobile } from "../../../hooks/useIsMobile";
 import {
@@ -19,7 +19,7 @@ import {
 import { useKeepInVisualViewport } from "../../../hooks/useKeepInVisualViewport";
 import { useSlashCommands } from "../../../hooks/useSlashCommands";
 import SlashCommandMenu from "./SlashCommandMenu";
-import { agentChatApi } from "../../../api/modules/agentChat";
+import { textAssistApi } from "../../../api/modules/textAssist";
 import type { ChatAttachment } from "../hooks/useChat";
 import type { ResolvedModel } from "../../../api/types";
 import type { KnowledgeBase } from "../../../api/modules/knowledgeBases";
@@ -29,7 +29,6 @@ import type { AgentSubagentSummary } from "../../../api/modules/subagents";
 import MentionPickerMenu from "./MentionPickerMenu";
 import ChatInputPreviewBar from "./ChatInputPreviewBar";
 import ChatInputActionsRow from "./ChatInputActionsRow";
-import ChatComposerChrome from "./ChatComposerChrome";
 import ChatQueuedMessages from "./ChatQueuedMessages";
 import { useVoiceInput } from "../../../hooks/useVoiceInput";
 import { useChatAttachments } from "../hooks/useChatAttachments";
@@ -63,7 +62,6 @@ import type {
 } from "../hooks/useChatMessageQueue";
 import type { HitlSessionPolicy } from "../utils/hitlSessionPolicy";
 import styles from "../index.module.less";
-import { BEFORE_CLIENT_CONFIG_REFRESH_EVENT } from "../../../utils/clientConfigUpdate";
 
 /** Imperative handle exposed via ref for programmatic text injection. */
 export interface ChatInputHandle {
@@ -141,8 +139,7 @@ interface ChatInputProps {
   defaultModel?: string | null;
   contextUsedTokens?: number | null;
   contextMaxTokens?: number;
-  contextBreakdown?: ContextUsageBreakdown | null;
-  sessionUsageLabel?: string | null;
+  decisionSaved?: number;
 }
 
 const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
@@ -198,8 +195,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       defaultModel,
       contextUsedTokens = null,
       contextMaxTokens = 128_000,
-      contextBreakdown = null,
-      sessionUsageLabel = null,
+      decisionSaved = 0,
     },
     ref,
   ) {
@@ -209,6 +205,20 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
     const skillDisplayName = useSkillDisplayName();
     const isMobile = useIsMobile();
     const shellRef = useRef<HTMLDivElement>(null);
+    const [nativeDropActive, setNativeDropActive] = useState(false);
+    useEffect(() => {
+      const el = shellRef.current;
+      if (!el) return;
+      const sync = () => {
+        setNativeDropActive(el.classList.contains("file-drop-target-active"));
+      };
+      const observer = new MutationObserver(sync);
+      observer.observe(el, {
+        attributes: true,
+        attributeFilter: ["class"],
+      });
+      return () => observer.disconnect();
+    }, []);
     const keepComposerInView =
       typeof window !== "undefined" &&
       !isPwaDisplay() &&
@@ -231,9 +241,19 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       setText(value);
     }, []);
 
-    const handleVoiceText = useCallback(
+    const textRef = useRef(text);
+    useEffect(() => {
+      textRef.current = text;
+    }, [text]);
+    // Text that existed before the current voice session started; the session's
+    // (possibly still refining) transcript is appended to it on every update.
+    const voiceBaselineRef = useRef("");
+
+    const applyVoiceText = useCallback(
       (spoken: string) => {
-        setText((prev) => (prev.trim() ? `${prev.trim()} ${spoken}` : spoken));
+        const base = voiceBaselineRef.current.trim();
+        const next = spoken.trim();
+        setText(base ? (next ? `${base} ${next}` : base) : next);
         userHasEditedRef.current = true;
         onUserInput?.();
       },
@@ -242,15 +262,26 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
     const {
       recording,
       transcribing,
+      realtime: realtimeVoice,
+      start: startVoice,
+      stop: stopVoice,
       toggle: toggleVoice,
-    } = useVoiceInput(handleVoiceText);
+    } = useVoiceInput({
+      onStart: () => {
+        voiceBaselineRef.current = textRef.current;
+      },
+      onInterim: applyVoiceText,
+      onText: applyVoiceText,
+    });
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const {
       attachments,
       uploading,
       dragOver,
       fileInputRef,
+      folderInputRef,
       handleFileSelect,
+      handleFolderSelect,
       handleFileChange,
       removeAttachment,
       clearAttachments,
@@ -425,42 +456,6 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
 
     // Persist draft while typing so leaving /chat and returning keeps content.
     useEffect(() => {
-      const beforeRefresh = (event: Event) => {
-        if (agentId) writeInputDraft(agentId, threadId, text);
-        if (
-          uploading ||
-          attachments.length > 0 ||
-          queuedItems?.length ||
-          recording ||
-          transcribing ||
-          browserRecording ||
-          browserReplayBusy
-        )
-          event.preventDefault();
-      };
-      window.addEventListener(
-        BEFORE_CLIENT_CONFIG_REFRESH_EVENT,
-        beforeRefresh,
-      );
-      return () =>
-        window.removeEventListener(
-          BEFORE_CLIENT_CONFIG_REFRESH_EVENT,
-          beforeRefresh,
-        );
-    }, [
-      agentId,
-      threadId,
-      text,
-      uploading,
-      attachments.length,
-      queuedItems?.length,
-      recording,
-      transcribing,
-      browserRecording,
-      browserReplayBusy,
-    ]);
-
-    useEffect(() => {
       if (!agentId) return;
       const timer = window.setTimeout(() => {
         writeInputDraft(agentId, threadId, text);
@@ -487,6 +482,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       mentionItems,
       filesLoading,
       filesError,
+      filesTruncated,
       runSlashCommand,
       matchSlashCommand,
       handleMentionSelect,
@@ -811,7 +807,14 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
         return;
       setPolishing(true);
       try {
-        const result = await agentChatApi.polish(agentId, draft, selectedModel);
+        const modelOverride = resolveTurnModelRef(selectedModel, defaultModel);
+        const result = await textAssistApi.assist({
+          kind: "chat.prompt",
+          text: draft,
+          agent_id: agentId,
+          // Omit model for automatic routing; pass only an explicit picker choice.
+          ...(modelOverride ? { default_model: modelOverride } : {}),
+        });
         const polished = stripThinkingTags(result.text?.trim() ?? "");
         if (!polished) {
           antMessage.error(t("chat.polish.emptyResult"));
@@ -841,34 +844,41 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
       holdSend,
       disabled,
       selectedModel,
+      defaultModel,
       t,
     ]);
 
     const canSend = Boolean(
       (text.trim() || attachments.length > 0) && !disabled,
     );
+    const showDrop = dragOver || nativeDropActive;
 
     return (
       <div
         ref={shellRef}
-        className={`${styles.chatInput} ${dragOver ? styles.dropActive : ""}`}
+        id="octop-chat-file-drop"
+        data-file-drop-target=""
+        data-octop-chat-drop="1"
+        className={cx(styles.chatInput, showDrop && styles.dropActive)}
         onDragEnter={handleDragEnter}
         onDragLeave={handleDragLeave}
         onDragOver={handleDragOver}
         onDrop={handleDrop}
       >
-        {onRemoveQueued && onReclaimQueued && (
-          <div className={styles.queuedMessagesDock}>
+        <div className={styles.inputWrapper}>
+          {showDrop && (
+            <div className={styles.dropOverlay} data-testid="chat-drop-overlay">
+              {t("upload.dropHint", "Drop files or a folder to upload")}
+            </div>
+          )}
+          {onRemoveQueued && onReclaimQueued && (
             <ChatQueuedMessages
               items={queuedItems}
               onRemove={onRemoveQueued}
               onReclaim={handleReclaimQueued}
               onSteer={onSteerQueued}
             />
-          </div>
-        )}
-        <ChatComposerChrome sessionUsageLabel={sessionUsageLabel} />
-        <div className={styles.inputWrapper}>
+          )}
           <ChatInputPreviewBar
             attachments={attachments}
             uploading={uploading}
@@ -948,6 +958,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
               subagents={availableSubagents}
               filesLoading={filesLoading}
               filesError={filesError}
+              filesTruncated={filesTruncated}
               activeIndex={mentionMenuIndex}
               onSelect={handleMentionSelect}
               onHover={setMentionMenuIndex}
@@ -994,6 +1005,9 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
             uploading={uploading}
             recording={recording}
             transcribing={transcribing}
+            voiceHoldToTalk={realtimeVoice}
+            onVoiceStart={() => void startVoice()}
+            onVoiceStop={() => void stopVoice()}
             browserRecording={browserRecording}
             browserReplayBusy={browserReplayBusy}
             browserLastRecordingId={browserLastRecordingId}
@@ -1004,7 +1018,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
             threadId={threadId}
             contextUsedTokens={contextUsedTokens}
             contextMaxTokens={contextMaxTokens}
-            contextBreakdown={contextBreakdown}
+            decisionSaved={decisionSaved}
             availableModels={availableModels}
             selectedModel={selectedModel}
             onModelChange={onModelChange}
@@ -1034,6 +1048,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
             slashMenuItems={slashMenuItems}
             onSlashShortcutSelect={handleSlashSelect}
             onFileSelect={handleFileSelect}
+            onFolderSelect={handleFolderSelect}
             onNewChat={onNewChat}
             onPolish={() => void handlePolish()}
             onToggleVoice={() => toggleVoice()}
@@ -1043,6 +1058,13 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(
 
           <input
             ref={fileInputRef}
+            type="file"
+            multiple
+            style={{ display: "none" }}
+            onChange={handleFileChange}
+          />
+          <input
+            ref={folderInputRef}
             type="file"
             multiple
             style={{ display: "none" }}

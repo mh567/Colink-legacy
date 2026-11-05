@@ -90,9 +90,6 @@ describe("toMediaPreviewSource", () => {
 });
 
 describe("needsAuthBlobFetch", () => {
-  it("requires authenticated bytes for colleague chat file downloads", () => {
-    expect(needsAuthBlobFetch("/api/im/media/asm_1?kind=original")).toBe(true);
-  });
   it("requires auth for uploaded expert avatars", () => {
     expect(needsAuthBlobFetch("/api/agents/agt_1/avatar")).toBe(true);
     expect(needsAuthBlobFetch("/api/agents/agt_1/avatar?v=9")).toBe(true);

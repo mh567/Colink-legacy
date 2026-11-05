@@ -16,30 +16,6 @@ describe("useChatMessageQueue", () => {
 
   const idleStreaming = () => false;
 
-  it("snapshots the device selection when queuing instead of using a later selection", () => {
-    const selected = {
-      mode: "local" as const,
-      device_id: "pc-1",
-      grant_id: "grant-1",
-      grant_version: 1,
-    };
-    const { result } = renderHook(() =>
-      useChatMessageQueue({
-        agentId: "agent-1",
-        threadId: "thread-1",
-        isStreaming: true,
-        onFlush: vi.fn(),
-        subscribeStreamEnd: () => () => undefined,
-        isThreadStreaming: idleStreaming,
-      }),
-    );
-    act(() => {
-      result.current.enqueue({ text: "read", device: selected });
-    });
-    selected.device_id = "pc-2";
-    expect(result.current.items[0].device?.device_id).toBe("pc-1");
-  });
-
   it("enqueues FIFO and enforces the max size", () => {
     const onFlush = vi.fn();
     const { result } = renderHook(() =>

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DesktopRuntimeBridge } from "@/api/desktopRuntime";
+import { describe, expect, it, vi } from "vitest";
 import type { ChatMessage } from "../hooks/useChat";
+import { COLLAPSE_THINKING_TEAM_KEY } from "../hooks/useCollapseThinking";
 import AssistantTurnView from "./AssistantTurnView";
 
 vi.mock("react-i18next", () => ({
@@ -61,66 +61,6 @@ function message(
   };
 }
 
-afterEach(() => {
-  delete window.__octopRuntime;
-});
-
-it("shows delivered images with a file action and hides redundant path metadata", async () => {
-  const file = {
-    path: "/work/thread/generated/golden-hour.png",
-    size: 123,
-    sha256: "a".repeat(64),
-  };
-  const previewImage = vi.fn().mockResolvedValue({
-    data_url: "data:image/png;base64,aW1hZ2U=",
-    width: 12,
-    height: 8,
-  });
-  const reveal = vi.fn().mockResolvedValue(undefined);
-  window.__octopRuntime = {
-    version: 1,
-    previewImage,
-    reveal,
-  } as unknown as DesktopRuntimeBridge;
-  render(
-    <AssistantTurnView
-      messages={[
-        message({
-          id: "answer",
-          content: "图生成好了：generated/golden-hour.png",
-          contentBlocks: [
-            {
-              type: "text",
-              content: "图生成好了：`generated/golden-hour.png`",
-            },
-          ],
-        }),
-        message({
-          id: "receipt",
-          content: "本次任务生成的本地文件",
-          localArtifacts: [file],
-        }),
-      ]}
-    />,
-  );
-  expect(
-    await screen.findByRole("img", { name: "本地图片预览：golden-hour.png" }),
-  ).toBeInTheDocument();
-  expect(screen.queryByText(file.path)).not.toBeInTheDocument();
-  expect(
-    screen.queryByText("generated/golden-hour.png"),
-  ).not.toBeInTheDocument();
-  expect(screen.queryByText(/SHA-256/)).not.toBeInTheDocument();
-  expect(screen.queryByText("本地任务成果")).not.toBeInTheDocument();
-  expect(screen.getByText("图生成好了")).toBeInTheDocument();
-  expect(previewImage).toHaveBeenCalledWith({
-    path: file.path,
-    sha256: file.sha256,
-  });
-  fireEvent.click(screen.getByRole("button", { name: "打开文件位置" }));
-  expect(reveal).toHaveBeenCalledWith({ path: file.path, sha256: file.sha256 });
-});
-
 describe("AssistantTurnView approval", () => {
   it("keeps the answer that arrived before the approval card", () => {
     render(
@@ -144,5 +84,80 @@ describe("AssistantTurnView approval", () => {
 
     expect(screen.getByText("磁盘还剩 8G")).toBeInTheDocument();
     expect(screen.getByText("Confirm this action")).toBeInTheDocument();
+  });
+
+  it("keeps host wrap-up below the divider and leaves the decision collapsed", () => {
+    render(
+      <AssistantTurnView
+        messages={[
+          message({
+            id: "wrap",
+            content: "今天就到这里",
+            teamWrapup: true,
+            speakerAgentId: "host",
+            decision: {
+              model: "laya",
+              empty: false,
+              parts: [
+                { kind: "result", kept: [{ name: "结果充分", score: 0.91 }] },
+              ],
+            },
+          }),
+        ]}
+      />,
+    );
+
+    const badge = screen.getByText("主持人总结");
+    const answer = screen.getByText("今天就到这里");
+    expect(
+      badge.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByText(/决策模型/)).toBeInTheDocument();
+    expect(screen.queryByText(/结果充分/)).not.toBeInTheDocument();
+  });
+
+  it("does not flash a lone decision row before tools arrive", () => {
+    localStorage.setItem(COLLAPSE_THINKING_TEAM_KEY, "true");
+    const decision = {
+      model: "laya",
+      empty: true,
+      parts: [],
+    };
+    const { rerender } = render(
+      <AssistantTurnView
+        isTurnInProgress
+        messages={[
+          message({
+            id: "pending",
+            status: "streaming",
+            decision,
+          }),
+        ]}
+      />,
+    );
+    expect(screen.queryByText(/决策模型/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+
+    rerender(
+      <AssistantTurnView
+        isTurnInProgress
+        messages={[
+          message({
+            id: "pending",
+            status: "done",
+            decision,
+          }),
+          message({
+            id: "tool",
+            status: "streaming",
+            toolData: { name: "execute", arguments: "{}" },
+          }),
+        ]}
+      />,
+    );
+    const summary = screen.getByRole("button", { name: /正在调用工具/ });
+    expect(screen.queryByText(/决策模型/)).not.toBeInTheDocument();
+    fireEvent.click(summary);
+    expect(screen.getByText(/决策模型/)).toBeInTheDocument();
   });
 });

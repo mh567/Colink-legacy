@@ -114,7 +114,6 @@ def test_sidebar_nav_roundtrip_preserves_other_keys() -> None:
         "items": [
             {"key": "chat"},
             {"key": "personalization", "group": "settings"},
-            {"key": "local-workspace", "group": "settings"},
             {"key": "tasks", "hidden": True, "group": "settings"},
         ],
     }
@@ -123,7 +122,6 @@ def test_sidebar_nav_roundtrip_preserves_other_keys() -> None:
     assert saved is not None
     assert saved["groups"][0] == {"id": "settings", "name": "配置"}
     assert saved["groups"][1]["id"] == "c_aabbccdd11223344"
-    assert {"key": "local-workspace", "group": "settings"} in saved["items"]
     hidden = next(item for item in saved["items"] if item["key"] == "tasks")
     assert hidden == {"key": "tasks", "hidden": True}
     assert '"foo": 1' in merged or '"foo":1' in merged

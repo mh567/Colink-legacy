@@ -16,18 +16,14 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
+import cx from "classnames";
 import type { ChatAttachment, ChatMessage } from "../hooks/useChat";
 import UserMessageComposerTags, {
   hasUserComposerTags,
   type ComposerTagLookups,
 } from "./UserMessageComposerTags";
 import { deriveMessageContent } from "../utils/messageContent";
-import {
-  inferKindFromNameAndMime,
-  stripLocalAttachmentHints,
-} from "../utils/chatAttachments";
-import { LocalImagePreview } from "./LocalImagePreview";
-import { useDesktopWorkspace } from "../../../context/DesktopWorkspaceContext";
+import { inferKindFromNameAndMime } from "../utils/chatAttachments";
 import { ChatMediaPlayer } from "./ChatMediaPlayer";
 import { useAuthImageSrc } from "../../../hooks/useAuthImageSrc";
 import {
@@ -77,13 +73,12 @@ import {
 } from "../../../plugins/toolRenderers";
 import { BuiltinOctopUiFallback } from "../../../plugins/toolRenderers/builtin/BuiltinOctopUiFallback";
 import { ToolUiErrorBoundary } from "../../../plugins/toolRenderers/ToolUiErrorBoundary";
-import { lookupPluginIdForTool } from "../../../plugins/toolRenderers/toolPluginIndex";
-import { useChatToolDock } from "../ChatToolDockContext";
-import ForwardMessageButton from "../../Messaging/ForwardMessageButton";
+import { remotePluginUiUnavailable } from "../../../plugins/toolRenderers/remotePluginUi";
 import {
-  agentForwardContent,
-  type ForwardContent,
-} from "../../Messaging/forwardContent";
+  lookupPluginIdForTool,
+  useToolPluginIndexVersion,
+} from "../../../plugins/toolRenderers/toolPluginIndex";
+import { useChatToolDock } from "../ChatToolDockContext";
 import { useToolUiDockButtonStyle } from "../hooks/useToolUiDockButtonStyle";
 import type { ParsedToolOutput } from "../../../plugins/toolRenderers/types";
 import type { ToolRendererRegistration } from "../../../plugins/toolRenderers/types";
@@ -111,13 +106,29 @@ interface MessageBubbleProps {
   onRunShellCommand?: (code: string) => void;
   shellCommandDisabled?: boolean;
   shellCommandDisabledTitle?: string;
-  forwardContent?: ForwardContent;
-  forwardDisabled?: boolean;
+}
+
+function formatElapsedSeconds(durationMs: number | undefined): string | null {
+  if (
+    typeof durationMs !== "number" ||
+    !Number.isFinite(durationMs) ||
+    durationMs < 0
+  ) {
+    return null;
+  }
+  const seconds = durationMs / 1000;
+  return seconds < 10 ? seconds.toFixed(1) : String(Math.round(seconds));
 }
 
 function formatTokenUsage(
   usage: ChatMessage["usage"],
-  labels: { input: string; output: string; total: string; cacheHit: string },
+  labels: {
+    input: string;
+    output: string;
+    total: string;
+    cacheHit: string;
+    decisionSaved: string;
+  },
 ): string[] {
   if (!usage) return [];
 
@@ -142,6 +153,9 @@ function formatTokenUsage(
   }
   if (typeof usage.total_tokens === "number") {
     parts.push(`${usage.total_tokens} ${labels.total}`);
+  }
+  if (typeof usage.decision_saved === "number" && usage.decision_saved > 0) {
+    parts.push(`${usage.decision_saved} ${labels.decisionSaved}`);
   }
   return parts;
 }
@@ -271,40 +285,30 @@ function ImageGallery({
   images,
   agentId,
 }: {
-  images: ChatAttachment[];
+  images: Array<{
+    url: string;
+    filename?: string;
+    workspacePath?: string;
+    mediaType?: string;
+  }>;
   agentId?: string | null;
 }) {
-  const desktop = useDesktopWorkspace();
-  const previewScope = JSON.stringify([
-    desktop.state?.owner_user_id,
-    desktop.state?.path,
-    desktop.state?.grant?.id,
-    desktop.state?.grant?.version,
-  ]);
   if (!images || images.length === 0) return null;
 
   return (
     <div className={styles.messageImages}>
-      <Image.PreviewGroup key={previewScope}>
-        {images.map((img, idx) =>
-          img.localFile ? (
-            <LocalImagePreview
-              key={img.localFile.path + img.localFile.sha256}
-              file={img.localFile}
-              scope={previewScope}
-            />
-          ) : (
-            <RefreshableImage
-              key={`${img.url}-${idx}`}
-              url={img.url}
-              filename={img.filename}
-              workspacePath={img.workspacePath}
-              mediaType={img.mediaType}
-              idx={idx}
-              agentId={agentId}
-            />
-          ),
-        )}
+      <Image.PreviewGroup>
+        {images.map((img, idx) => (
+          <RefreshableImage
+            key={`${img.url}-${idx}`}
+            url={img.url}
+            filename={img.filename}
+            workspacePath={img.workspacePath}
+            mediaType={img.mediaType}
+            idx={idx}
+            agentId={agentId}
+          />
+        ))}
       </Image.PreviewGroup>
     </div>
   );
@@ -328,7 +332,6 @@ function FileAttachmentList({
           filename={file.filename}
           agentId={agentId}
           workspacePath={file.workspacePath}
-          localFile={file.localFile}
         />
       ))}
     </div>
@@ -402,6 +405,7 @@ export function ToolDetailsInline({
   const toolDock = useChatToolDock();
   // Plugin UIs load async after mount — bump forces resolve() to re-run.
   const rendererVersion = useToolRendererVersion();
+  useToolPluginIndexVersion();
   const parsed = useMemo(
     () => parseOctopToolOutput(toolData.output),
     [toolData.output],
@@ -537,13 +541,21 @@ export function ToolDetailsInline({
 
   // Structured plugin envelope without a loaded custom renderer — still show a card.
   if (parsed.octopUi) {
+    const annotateMissingPlugin = remotePluginUiUnavailable({
+      agentId,
+      toolName: toolData.name,
+      hasOctopUi: true,
+    });
     return (
       <div
         ref={wrapRef}
         data-octop-tool-renderer=""
         className={styles.toolUiRendererWrap}
       >
-        <BuiltinOctopUiFallback {...props} />
+        <BuiltinOctopUiFallback
+          {...props}
+          annotateMissingPlugin={annotateMissingPlugin}
+        />
         {dockActions}
       </div>
     );
@@ -574,8 +586,6 @@ function MessageBubble({
   onRunShellCommand,
   shellCommandDisabled,
   shellCommandDisabledTitle,
-  forwardContent,
-  forwardDisabled,
 }: MessageBubbleProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -640,9 +650,15 @@ function MessageBubble({
         output: t("chatUsage.output"),
         total: t("chatUsage.total"),
         cacheHit: t("chatUsage.cacheHit"),
+        decisionSaved: t("chatUsage.decisionSaved"),
       }),
     [message.usage, t],
   );
+  const elapsedText = formatElapsedSeconds(message.durationMs);
+  const usageLine = [
+    elapsedText ? t("chatUsage.elapsed", { seconds: elapsedText }) : "",
+    ...usageParts,
+  ].filter(Boolean);
   const errorDebugTags = useMemo(
     () => formatErrorDebugTags(message.errorInfo),
     [message.errorInfo],
@@ -656,10 +672,6 @@ function MessageBubble({
     () => prepareSpeechText(textContent),
     [textContent],
   );
-  const forwardPayload = useMemo(
-    () => forwardContent ?? agentForwardContent([message], agentId),
-    [forwardContent, message, agentId],
-  );
 
   if (message.hitlData) {
     const actions = message.hitlData.action_requests ?? [];
@@ -671,9 +683,11 @@ function MessageBubble({
       const questions = extractAskQuestions(actions);
       return (
         <div
-          className={`${styles.messageBubble} ${styles.assistantBubble} ${
-            compact ? styles.compactBubble : ""
-          }`}
+          className={cx(
+            styles.messageBubble,
+            styles.assistantBubble,
+            compact && styles.compactBubble,
+          )}
         >
           <div className={styles.bubbleContent}>
             <AskQuestionCard questions={questions} status={hitlStatus} />
@@ -683,9 +697,11 @@ function MessageBubble({
     }
     return (
       <div
-        className={`${styles.messageBubble} ${styles.assistantBubble} ${
-          compact ? styles.compactBubble : ""
-        }`}
+        className={cx(
+          styles.messageBubble,
+          styles.assistantBubble,
+          compact && styles.compactBubble,
+        )}
       >
         <div className={styles.bubbleContent}>
           <HitlApprovalCard
@@ -727,7 +743,6 @@ function MessageBubble({
   );
   const videoAttachments = attachments.filter(
     (attachment) =>
-      !attachment.localFile &&
       inferKindFromNameAndMime(
         attachment.mediaType,
         attachment.filename,
@@ -736,7 +751,6 @@ function MessageBubble({
   );
   const audioAttachments = attachments.filter(
     (attachment) =>
-      !attachment.localFile &&
       inferKindFromNameAndMime(
         attachment.mediaType,
         attachment.filename,
@@ -749,23 +763,9 @@ function MessageBubble({
         attachment.mediaType,
         attachment.filename,
         attachment.kind,
-      ) === "file" ||
-      Boolean(attachment.localFile && !imageAttachments.includes(attachment)),
+      ) === "file",
   );
-  const userText = stripLocalAttachmentHints(message.content, attachments);
   const hasAttachments = attachments.length > 0;
-  const canForward =
-    !isStreaming &&
-    !isError &&
-    !hasToolData &&
-    !isEditing &&
-    !message.steerPending &&
-    (isUser || message.role === "assistant") &&
-    Boolean(
-      forwardPayload.text ||
-        forwardPayload.attachments.length ||
-        forwardPayload.localArtifacts.length,
-    );
 
   // Determine if this bubble is at the top/bottom of an assistant group
   const isLastInGroup = groupPosition === "last" || groupPosition === "only";
@@ -826,11 +826,13 @@ function MessageBubble({
 
   return (
     <div
-      className={`${styles.messageBubble} ${
-        isUser ? styles.userBubble : styles.assistantBubble
-      } ${showUserComposerTags ? styles.userBubbleWithTags : ""} ${
-        isError ? styles.errorBubble : ""
-      } ${compact ? styles.compactBubble : ""}`}
+      className={cx(
+        styles.messageBubble,
+        isUser ? styles.userBubble : styles.assistantBubble,
+        showUserComposerTags && styles.userBubbleWithTags,
+        isError && styles.errorBubble,
+        compact && styles.compactBubble,
+      )}
     >
       {!isUser && senderAvatar ? (
         <div className={styles.avatarCol}>{senderAvatar}</div>
@@ -921,7 +923,7 @@ function MessageBubble({
                       agentId={agentId}
                     />
                   )}
-                  {userText && <div>{userText}</div>}
+                  {message.content && <div>{message.content}</div>}
                 </div>
               )}
             </div>
@@ -988,7 +990,7 @@ function MessageBubble({
                 )}
               </div>
             ) : (
-              <div className={`${styles.assistantText} ${groupCls}`}>
+              <div className={cx(styles.assistantText, groupCls)}>
                 {imageAttachments.length > 0 && (
                   <ImageGallery images={imageAttachments} agentId={agentId} />
                 )}
@@ -1045,17 +1047,17 @@ function MessageBubble({
         {isLastInGroup &&
           !hasToolData &&
           (message.timestamp > 0 ||
-            canForward ||
-            usageParts.length > 0 ||
+            usageLine.length > 0 ||
             (isUser &&
               !isEditing &&
               Boolean(
                 message.content || onEditUserMessage || message.steerPending,
               ))) && (
             <div
-              className={`${styles.msgMetaRow} ${
-                isUser ? styles.msgMetaRowRight : ""
-              }`}
+              className={cx(
+                styles.msgMetaRow,
+                isUser && styles.msgMetaRowRight,
+              )}
             >
               {isUser &&
                 !isEditing &&
@@ -1095,20 +1097,18 @@ function MessageBubble({
                 )}
               {message.timestamp > 0 && (
                 <div
-                  className={`${styles.msgTime} ${
-                    isUser ? styles.msgTimeRight : ""
-                  }`}
+                  className={cx(styles.msgTime, isUser && styles.msgTimeRight)}
                 >
                   {formatMessageTime(message.timestamp, serverTimezone)}
                   {!isUser && !isStreaming && speechText && (
                     <>
                       <CopyButton text={textContent} />
                       <button
-                        className={`${styles.msgActionBtn} ${
-                          speakingId === message.id
-                            ? styles.msgActionBtnActive
-                            : ""
-                        }`}
+                        className={cx(
+                          styles.msgActionBtn,
+                          speakingId === message.id &&
+                            styles.msgActionBtnActive,
+                        )}
                         onClick={(e) => {
                           e.stopPropagation();
                           speak(message.id, textContent);
@@ -1148,14 +1148,8 @@ function MessageBubble({
                   )}
                 </div>
               )}
-              {canForward && (
-                <ForwardMessageButton
-                  source={{ kind: "agent", content: forwardPayload }}
-                  disabled={forwardDisabled}
-                />
-              )}
-              {usageParts.length > 0 && (
-                <div className={styles.msgUsage}>{usageParts.join(" / ")}</div>
+              {usageLine.length > 0 && (
+                <div className={styles.msgUsage}>{usageLine.join(" / ")}</div>
               )}
             </div>
           )}

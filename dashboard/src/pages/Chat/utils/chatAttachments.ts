@@ -13,19 +13,6 @@ export function stripThinkingTags(text: string): string {
   return result.trim();
 }
 
-/** Keep native file hints for the runtime, while showing each attachment once. */
-export function stripLocalAttachmentHints(
-  text: string,
-  attachments: ChatAttachment[],
-): string {
-  if (!attachments.some((attachment) => attachment.localFile)) return text;
-  for (const attachment of attachments) {
-    if (attachment.localFile)
-      text = text.split(`[file: ${attachment.localFile.path}]`).join("");
-  }
-  return text.replace(/\n{3,}/g, "\n\n").trim();
-}
-
 export function isImageMediaType(mime?: string): boolean {
   return Boolean(mime?.startsWith("image/"));
 }

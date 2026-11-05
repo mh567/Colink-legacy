@@ -123,20 +123,6 @@ describe("useUpdateStatus", () => {
     expect(UPDATE_STATUS_CHANGED_EVENT).toBe("octop:update-status-changed");
   });
 
-  it("does not read stale updates or probe when disabled", async () => {
-    storeUpdateStatus(sample);
-    const { result } = renderHook(() => useUpdateStatus(false));
-    await act(async () => {
-      window.dispatchEvent(new Event("focus"));
-      storeUpdateStatus(sample);
-      vi.advanceTimersByTime(UPDATE_STATUS_POLL_MS * 2);
-      await result.current.refreshStatus(true);
-    });
-    expect(getUpdateStatus).not.toHaveBeenCalled();
-    expect(result.current.status).toBeNull();
-    expect(result.current.hasUpdate).toBe(false);
-  });
-
   it("trusts server has_update for chrome reminders", async () => {
     getUpdateStatus.mockResolvedValue({
       ...sample,

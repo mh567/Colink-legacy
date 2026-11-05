@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-printf '%s\n' 'Octop Enterprise: use source deployment from docker/enterprise/README.md. The upstream installer is disabled for this distribution.' >&2
-exit 1
-
 # Octop 安装脚本 (macOS / Linux)
 # 用法: bash scripts/install.sh              # 从 PyPI 安装（默认）
 #   或: bash scripts/install.sh --from-source  # 从本地源码安装

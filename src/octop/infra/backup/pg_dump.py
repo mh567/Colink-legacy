@@ -49,8 +49,6 @@ def restore_postgres(conninfo: str, dump_file: Path) -> None:
     proc = subprocess.run(
         [
             pg_restore,
-            "--single-transaction",
-            "--exit-on-error",
             "--clean",
             "--if-exists",
             "--no-owner",
@@ -62,7 +60,8 @@ def restore_postgres(conninfo: str, dump_file: Path) -> None:
         text=True,
         check=False,
     )
-    if proc.returncode != 0:
+    # pg_restore may return 1 with warnings; treat only >=2 as hard fail.
+    if proc.returncode >= 2:
         raise OctopError(
             ErrorCode.INTERNAL_ERROR,
             f"pg_restore failed: {proc.stderr.strip() or proc.stdout.strip()}",

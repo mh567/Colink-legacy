@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 import { Button, Tooltip } from "antd";
+import cx from "classnames";
 
+import { useIsMobile } from "../../hooks/useIsMobile";
 import styles from "./StreamSetupGuide.module.less";
 
 export interface SetupGuideStep {
@@ -39,8 +41,11 @@ interface StreamSetupGuideProps {
 }
 
 function ActionButton({ action }: { action: SetupGuideAction }) {
+  const isMobile = useIsMobile();
   const button = (
     <Button
+      block={isMobile}
+      autoInsertSpace={false}
       type={action.type ?? "primary"}
       danger={action.danger}
       icon={action.icon}
@@ -55,7 +60,7 @@ function ActionButton({ action }: { action: SetupGuideAction }) {
   // Span wrapper so tooltips still work on disabled buttons.
   return (
     <Tooltip title={action.title}>
-      <span>{button}</span>
+      <span className={styles.actionTooltipWrap}>{button}</span>
     </Tooltip>
   );
 }
@@ -73,14 +78,12 @@ export default function StreamSetupGuide({
   plain,
 }: StreamSetupGuideProps) {
   const hasActions = primaryAction || secondaryAction || extraAction;
-  const wrapClass = [
+  const wrapClass = cx(
     styles.wrap,
-    wide ? styles.wide : "",
-    plain ? styles.plain : "",
-    className ?? "",
-  ]
-    .filter(Boolean)
-    .join(" ");
+    wide && styles.wide,
+    plain && styles.plain,
+    className,
+  );
 
   return (
     <div className={wrapClass}>

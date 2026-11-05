@@ -77,8 +77,8 @@ src/octop/dashboard/assets/*
 !src/octop/dashboard/.gitkeep
 
 # Ship Meituan pt-passport runtime; override global node_modules/ ignore.
-!src/octop/infra/agents/experts/library/meituan-living-assistant/skills/meituan-deals/scripts/node_modules/
-!src/octop/infra/agents/experts/library/meituan-living-assistant/skills/meituan-deals/scripts/node_modules/**
+!marketplace/experts/meituan-living-assistant/skills/meituan-deals/scripts/node_modules/
+!marketplace/experts/meituan-living-assistant/skills/meituan-deals/scripts/node_modules/**
 
 # Local databases
 *.sqlite
@@ -114,19 +114,10 @@ fnos/native/app/site-packages/
 docs/superpowers/
 scripts/lh_image_install_octop_tencentos.sh
 .worktrees/
+# Local conda environment
+.conda-octop/
 
-# Generated bundled employee login (rebuilt by package-company.py)
-desktop/src/assets/login.bundle.js
-desktop/src/assets/login.bundle.css
-desktop/src/assets/company-dashboard.zip
-desktop/src/assets/company-dashboard.json
+# Local MFA E2E scratch (recovery codes, screenshots with secrets)
+.tmp-mfa/
+.tmp-mfa-e2e/
 
-# Local acceptance outputs and browser snapshots (may contain runtime receipts)
-/output/
-/dashboard/.playwright-cli/
-
-# Root browser captures may contain private sessions and screenshots
-/.playwright-cli/
-
-# Generated source export manifest (kept with source archives, not Git history)
-/PUBLIC_SOURCE.json

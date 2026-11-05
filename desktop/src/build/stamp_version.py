@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 _MANIFEST_IDENTITY = re.compile(
-    r'(<assemblyIdentity\b[^>]*\bname="io\.github\.colorai\.octop\.enterprise"[^>]*\bversion=")[^"]+(")',
+    r'(<assemblyIdentity\b[^>]*\bname="com\.tencent\.octop"[^>]*\bversion=")[^"]+(")',
     re.IGNORECASE,
 )
 

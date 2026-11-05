@@ -16,7 +16,6 @@ import {
   truncatePushText,
 } from "../utils/dashboardPushToast";
 import styles from "./useDashboardPushToast.module.less";
-import { CLIENT_CONFIG_CHECK_EVENT } from "../utils/clientConfigUpdate";
 
 const PING_INTERVAL_MS = 25_000;
 const MAX_RETRY_MS = 15_000;
@@ -103,21 +102,12 @@ export function useDashboardPushToast(): void {
       ws = socket;
       socket.onopen = () => {
         retry = 0;
-        window.dispatchEvent(new Event(CLIENT_CONFIG_CHECK_EVENT));
       };
       socket.onmessage = (event) => {
         let raw: unknown;
         try {
           raw = JSON.parse(String(event.data));
         } catch {
-          return;
-        }
-        if (
-          raw &&
-          typeof raw === "object" &&
-          (raw as { type?: string }).type === "client_config_changed"
-        ) {
-          window.dispatchEvent(new Event(CLIENT_CONFIG_CHECK_EVENT));
           return;
         }
         if (

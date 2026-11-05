@@ -6,17 +6,6 @@ import (
 	"testing"
 )
 
-func TestMainWindowUsesNativeFramesOnWindowsAndMac(t *testing.T) {
-	for _, platform := range []string{"windows", "darwin"} {
-		if mainWindowFrameless(platform) {
-			t.Fatalf("%s main window must use system titlebar and resize frame", platform)
-		}
-	}
-	if !mainWindowFrameless("linux") {
-		t.Fatal("Linux window chrome changed unexpectedly")
-	}
-}
-
 func TestDesktopDragRegionClassMatchesDashboard(t *testing.T) {
 	if desktopDragRegionClass != "octop-desktop-drag" {
 		t.Fatalf("drag region class is %q, dashboard CSS will not apply", desktopDragRegionClass)
@@ -28,9 +17,12 @@ func TestDragOverlayJSStartsWailsDragWithoutCapturingOverlay(t *testing.T) {
 	for _, needle := range []string{
 		"wails:drag",
 		"wails:drag:doubleclick",
+		"wails:resize:",
 		"--wails-draggable",
 		"data-octop-no-drag",
 		"clientY <= 32",
+		"ns-resize",
+		"nwse-resize",
 	} {
 		if !strings.Contains(js, needle) {
 			t.Fatalf("drag JS missing %q", needle)
@@ -38,6 +30,9 @@ func TestDragOverlayJSStartsWailsDragWithoutCapturingOverlay(t *testing.T) {
 	}
 	if strings.Contains(js, "octop-window-drag-overlay") {
 		t.Fatal("full-width capturing overlay would steal title-bar clicks")
+	}
+	if strings.Contains(js, "createElement") {
+		t.Fatal("edge resize must not build overlay elements; it rides on window events only")
 	}
 }
 

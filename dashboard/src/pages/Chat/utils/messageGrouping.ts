@@ -65,9 +65,8 @@ export function sameGroupedSpeaker(
 /** Last text bubble of this speaker in the current turn (before a later tool).
  *
  * Other speakers are skipped, not treated as a turn break — host and member
- * tokens interleave on the team room socket. A user message, or a new host
- * dispatch after a wrap-up, separates turns even when another client sent
- * the request and its user message has not loaded yet.
+ * tokens interleave on the team room socket. Stop only at the last user
+ * message so a later turn cannot resume the previous one.
  *
  * ``continueThroughTools`` only skips *in-flight* tools (no output yet). A
  * completed ``ask_agent`` is a turn break so the host wrap-up after members
@@ -90,15 +89,10 @@ export function findSpeakerTextToContinue(
     !isRoomHostSpeaker(speakerId, hostAgentId);
   let lastTool = -1;
   let lastText = -1;
-  let sawHostDispatch = false;
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
     if (message.role === "user") break;
     if (message.role !== "assistant") continue;
-    if (teamRoom && isRoomHostSpeaker(message.speakerAgentId, hostAgentId)) {
-      if (message.teamWrapup && sawHostDispatch) break;
-      if (!message.teamWrapup) sawHostDispatch = true;
-    }
     if (
       !sameStreamingSpeaker(
         message.speakerAgentId,

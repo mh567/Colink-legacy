@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from html import escape
 from pathlib import Path
@@ -93,6 +94,22 @@ async def test_catalog(env):
         "credential_fields": [],
         "supports_quick_auth": True,
     }
+
+
+async def test_catalog_localizes_with_accept_language(env):
+    c, _, auth, _ = env
+    r = await c.get("/api/connectors/catalog", headers={**auth, "Accept-Language": "en"})
+    assert r.status_code == 200
+    openalex = next(e for e in r.json() if e["kind"] == "openalex")
+    assert openalex["name"] == "OpenAlex"
+    assert openalex["description"].startswith("Official MCP")
+    assert "system browser" in (openalex["auth_hint"] or "")
+
+    r = await c.get("/api/connectors/catalog", headers={**auth, "Accept-Language": "zh"})
+    assert r.status_code == 200
+    openalex = next(e for e in r.json() if e["kind"] == "openalex")
+    assert openalex["description"].startswith("官方 MCP")
+    assert "系统浏览器" in (openalex["auth_hint"] or "")
 
 
 async def test_create_tencent_instance(env):
@@ -268,6 +285,45 @@ async def test_shared_connector_is_visible_but_not_manageable_by_other_user(env)
         json={"display_name": "不能修改"},
     )
     assert patched.status_code == 403
+
+
+async def test_admin_cannot_edit_another_users_shared_connector(env):
+    c, _, admin_auth, _ = env
+    owner_auth = await create_user(c, admin_auth, username="connector_owner")
+    created = await c.post(
+        "/api/connector-instances",
+        headers=owner_auth,
+        json={
+            "kind": "tencent-docs",
+            "display_name": "所有者的文档",
+            "credentials": {"token": "owner-token"},
+            "shared": True,
+        },
+    )
+    assert created.status_code == 201
+    instance_id = created.json()["instance_id"]
+
+    listed = await c.get("/api/connector-instances", headers=admin_auth)
+    assert listed.status_code == 200
+    shared = next(row for row in listed.json() if row["instance_id"] == instance_id)
+    assert shared["can_manage"] is False
+
+    denied = await c.patch(
+        f"/api/connector-instances/{instance_id}",
+        headers=admin_auth,
+        json={"display_name": "管理员不能改"},
+    )
+    assert denied.status_code == 403
+    hidden = await c.get(f"/api/connector-instances/{instance_id}", headers=admin_auth)
+    assert hidden.status_code == 403
+
+    renamed = await c.patch(
+        f"/api/connector-instances/{instance_id}",
+        headers=owner_auth,
+        json={"display_name": "所有者可以改"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["display_name"] == "所有者可以改"
 
 
 async def test_chat_accepts_user_instance_mcp(env):
@@ -453,10 +509,65 @@ async def test_catalog_weknora_dify_last(env):
     kinds = [e["kind"] for e in r.json()]
     assert "feishu-cli" in kinds
     assert "wecom-cli" in kinds
+    assert kinds.index("dingtalk-cli") < kinds.index("weknora")
     assert kinds.index("feishu-cli") < kinds.index("weknora")
+    assert kinds.index("obsidian-cli") < kinds.index("weknora")
     assert kinds.index("wecom-cli") < kinds.index("dify")
     assert kinds.index("didi") < kinds.index("weknora")
     assert kinds[-2:] == ["weknora", "dify"]
+
+
+async def test_obsidian_cli_install_registers_binary(
+    env, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    c, _, auth, _ = env
+    home = tmp_path / "home"
+    source = tmp_path / "Obsidian.app" / "Contents" / "MacOS" / "obsidian-cli"
+    source.parent.mkdir(parents=True)
+    source.write_text("obsidian", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+    monkeypatch.setattr(
+        "octop.infra.connectors.gateway.cli_install.obsidian_bundle_candidates",
+        lambda: [str(source)],
+    )
+    monkeypatch.setattr(
+        "octop.infra.connectors.gateway.cli_install._prefix_writable",
+        lambda _prefix: False,
+    )
+    monkeypatch.setattr(
+        "octop.infra.connectors.gateway.cli_install._read_version",
+        lambda _path: "1.12.7",
+    )
+    dest_name = "obsidian.exe" if os.name == "nt" else "obsidian"
+    dest = home / ".local" / "bin" / dest_name
+
+    def _which(name: str) -> str | None:
+        if name == "obsidian" and dest.is_file():
+            return str(dest)
+        return None
+
+    monkeypatch.setattr(
+        "octop.infra.connectors.gateway.cli_install.shutil.which",
+        _which,
+    )
+
+    status = await c.get("/api/connectors/obsidian-cli/cli-status", headers=auth)
+    assert status.status_code == 200
+    body = status.json()
+    assert body["installed"] is False
+    assert body["binary"] == "obsidian"
+    assert body["install_command"]
+    assert "npm" not in body["install_command"]
+
+    installed = await c.post("/api/connectors/obsidian-cli/install-cli", headers=auth)
+    assert installed.status_code == 200
+    payload = installed.json()
+    assert payload["ok"] is True
+    assert payload["already_installed"] is False
+    assert payload["installed"] is True
+    assert dest.is_file()
 
 
 async def test_install_cli_forbidden_for_non_admin(env):
@@ -580,6 +691,39 @@ async def test_shared_custom_mcp_is_visible_with_collision_safe_name(env):
     assert shared["can_manage"] is False
     assert shared["mcp_server_name"].startswith("custom__")
     assert shared["mcp_server_name"].endswith("__linear")
+
+    denied = await c.patch(
+        f"/api/connector-instances/{shared['instance_id']}",
+        headers=user_auth,
+        json={"status": "disabled"},
+    )
+    assert denied.status_code == 403
+
+
+async def test_private_custom_mcp_is_hidden_from_other_users(env):
+    c, _, admin_auth, _ = env
+    put = await c.put(
+        "/api/connectors/custom-mcp",
+        headers=admin_auth,
+        json={
+            "servers": {
+                "private": {
+                    "transport": "streamable_http",
+                    "url": "https://private.example.com/mcp",
+                    "display_name": "仅自己的 MCP",
+                }
+            }
+        },
+    )
+    assert put.status_code == 200
+
+    user_auth = await create_user(c, admin_auth, username="custom_private_reader")
+    listed = await c.get("/api/connector-instances", headers=user_auth)
+    assert listed.status_code == 200
+    assert all(row.get("display_name") != "仅自己的 MCP" for row in listed.json())
+    names = await c.get("/api/connectors/custom-mcp", headers=user_auth)
+    assert names.status_code == 200
+    assert names.json()["servers"] == {}
 
 
 async def test_custom_mcp_oauth_callback_applies_tokens(env):

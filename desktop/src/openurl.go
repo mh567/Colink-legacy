@@ -60,10 +60,13 @@ func attachOpenURLEventListener(app *application.App, open func(string) error) {
 	if app == nil || open == nil {
 		return
 	}
-	attachDesktopEventListener(app, &openURLEventListener{open: open})
+	appendWailsEventListener(app, &openURLEventListener{open: open})
 }
 
-func attachDesktopEventListener(app *application.App, listener application.WailsEventListener) {
+// appendWailsEventListener receives events emitted with wails:event:emit.
+// The remote dashboard never loads /wails/runtime.js, so this is the channel
+// back from window._wails.invoke.
+func appendWailsEventListener(app *application.App, listener application.WailsEventListener) {
 	if app == nil || listener == nil {
 		return
 	}
@@ -71,7 +74,7 @@ func attachDesktopEventListener(app *application.App, listener application.Wails
 	lockField := root.FieldByName("wailsEventListenerLock")
 	listField := root.FieldByName("wailsEventListeners")
 	if !lockField.IsValid() || !listField.IsValid() {
-		log.Printf("open-url: wails event listener field missing")
+		log.Printf("wails event listener field missing")
 		return
 	}
 	lock := reflect.NewAt(lockField.Type(), unsafe.Pointer(lockField.UnsafeAddr())).Interface().(*sync.Mutex)
@@ -149,7 +152,11 @@ func injectExternalLinksJS() string {
 	var origOpen = window.open;
 	window.open = function(url, target) {
 		var name = target == null ? "_blank" : String(target);
-		if (url && name.toLowerCase() === "_blank" && openExternal(url)) return null;
+		var lower = name.toLowerCase();
+		if (lower === "_self" || lower === "_parent" || lower === "_top") {
+			return origOpen.apply(this, arguments);
+		}
+		if (url && openExternal(url)) return null;
 		return origOpen.apply(this, arguments);
 	};
 })();`

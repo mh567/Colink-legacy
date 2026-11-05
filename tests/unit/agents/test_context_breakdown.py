@@ -106,7 +106,7 @@ async def test_fallback_to_stream_input_tokens_when_empty() -> None:
         input_tokens=9_000,
     )
     assert result.used_tokens == 9_000
-    assert result.segments["conversation"] == 0
+    assert result.segments["conversation"] == 9_000
     assert result.segments["skills"] == 0
     assert result.segments["system_prompt"] == 0
 
@@ -121,7 +121,7 @@ async def test_fallback_when_harness_lacks_getter() -> None:
         input_tokens=4_200,
     )
     assert result.used_tokens == 4_200
-    assert result.segments["conversation"] == 0
+    assert result.segments["conversation"] == 4_200
 
 
 @pytest.mark.asyncio
@@ -222,7 +222,7 @@ async def test_empty_snapshot_uses_usage_ledger_without_checkpoint() -> None:
         usage_repo=usage_repo,
     )
     assert result.used_tokens == 4200
-    assert result.segments["conversation"] == 0
+    assert result.segments["conversation"] == 4200
     registry.get_agent.return_value.aget_history.assert_not_awaited()
 
 
@@ -239,61 +239,4 @@ async def test_live_harness_missing_falls_back_to_query_hint() -> None:
         input_tokens=9_000,
     )
     assert result.used_tokens == 9_000
-    assert result.segments["conversation"] == 0
-
-
-@pytest.mark.asyncio
-async def test_local_runtime_metadata_restores_segments_without_checkpoint() -> None:
-    registry = _registry(None)
-    messages = SimpleNamespace(
-        last_context_usage=MagicMock(
-            return_value={
-                "max_tokens": 128_000,
-                "used_tokens": 11313,
-                "input_tokens": 11313,
-                "segments": {
-                    "system_prompt": 2436,
-                    "tool_definitions": 5483,
-                    "skills": 3058,
-                    "conversation": 623,
-                },
-            }
-        )
-    )
-    ledger = MagicMock()
-    result = await compute_context_breakdown(
-        registry,
-        agent_id="agt",
-        thread_id="local",
-        max_tokens=262144,
-        usage_repo=ledger,
-        message_repo=messages,
-    )
-    assert result.max_tokens == 262144
-    assert result.used_tokens == 11313
-    assert result.segments["system_prompt"] == 2436
-    assert result.segments["tool_definitions"] == 5483
-    assert result.segments["skills"] == 3058
-    assert result.segments["conversation"] == 623
-    messages.last_context_usage.assert_called_once_with("local")
-    ledger.last_thread_input_tokens.assert_not_called()
-    registry.get_agent.return_value.aget_history.assert_not_awaited()
-    registry.get_agent.return_value.aget_context_usage.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_malformed_local_metadata_falls_back_to_ledger() -> None:
-    messages = SimpleNamespace(
-        last_context_usage=lambda _: {"segments": {"system_prompt": "invalid"}}
-    )
-    ledger = SimpleNamespace(last_thread_input_tokens=lambda **_: 4200)
-    result = await compute_context_breakdown(
-        _registry(None),
-        agent_id="agt",
-        thread_id="local",
-        max_tokens=128000,
-        usage_repo=ledger,
-        message_repo=messages,
-    )
-    assert result.used_tokens == 4200
-    assert result.segments["conversation"] == 0
+    assert result.segments["conversation"] == 9_000

@@ -1,10 +1,6 @@
 import { request } from "../request";
 
-export type MediaProviderName =
-  | "volcengine"
-  | "dashscope"
-  | "minimax"
-  | "openai";
+export type MediaProviderName = "volcengine" | "dashscope" | "minimax";
 
 export interface MediaProviderPreset {
   provider: MediaProviderName;

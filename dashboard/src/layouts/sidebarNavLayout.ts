@@ -114,30 +114,7 @@ export function editorFromCatalog(
     }
   }
   for (const key of defaultKeyOrder(base)) {
-    if (!seen.has(key)) {
-      // Company used to be a tab inside chat and was absent from saved menus.
-      if (key === "contacts") {
-        const agentIndex = ungrouped.indexOf("chat");
-        ungrouped.splice(agentIndex < 0 ? 0 : agentIndex, 0, key);
-      } else {
-        // A saved layout only knows modules available when it was saved.
-        // New grants belong in their default section unless explicitly hidden.
-        const defaultGroup = base.groups.find(
-          (group) => base.itemsByGroup[group.id]?.includes(key),
-        );
-        if (!defaultGroup) {
-          ungrouped.push(key);
-          continue;
-        }
-        if (!itemsByGroup[defaultGroup.id]) {
-          groups.push({ ...defaultGroup });
-          itemsByGroup[defaultGroup.id] = [];
-        }
-        if (key === "local-workspace")
-          itemsByGroup[defaultGroup.id].unshift(key);
-        else itemsByGroup[defaultGroup.id].push(key);
-      }
-    }
+    if (!seen.has(key)) hidden.push(key);
   }
   return { groups, ungrouped, itemsByGroup, hidden };
 }

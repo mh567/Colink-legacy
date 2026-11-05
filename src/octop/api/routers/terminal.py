@@ -454,10 +454,6 @@ async def terminal_context(
     if row is None:
         raise OctopError(ErrorCode.AGENT_NOT_FOUND, "no agents for user")
     assert_agent_owner(row, user)
-    from octop.infra.backend.isolation import isolation_enabled
-
-    if isolation_enabled() and not user.is_admin:
-        raise OctopError(ErrorCode.FORBIDDEN, "host terminal is unavailable for isolated employees")
     # AI-facing path: persisted config value (e.g. ``/.octop/workspaces/<id>``).
     # PTY spawn still uses the host-mapped path via resolve_agent_workspace_dir.
     cfg = server.app_runtime.agent_registry.get_config(agent_id)
@@ -525,11 +521,6 @@ async def terminal_ws(
         user = resolve_user_from_token(server, token)
     except OctopError as exc:
         await websocket.close(code=4001, reason=f"auth: {exc.code.value}")
-        return
-    from octop.infra.backend.isolation import isolation_enabled
-
-    if isolation_enabled() and not user.is_admin:
-        await websocket.close(code=4003, reason="host terminal unavailable for isolated employees")
         return
     if not user_has_permission(user, "terminal"):
         await websocket.close(code=4003, reason="permission required")

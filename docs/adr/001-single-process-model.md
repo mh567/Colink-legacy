@@ -3,10 +3,6 @@
 **Status:** Accepted
 **Date:** 2026-06
 
-> Historical base-mode architecture decision. Octop Enterprise deployment also
-> uses PostgreSQL, the communication service and Docker isolation; follow the
-> [enterprise deployment guide](../../docker/enterprise/README_EN.md) for current installation.
-
 ---
 
 ## Context
@@ -19,7 +15,7 @@ Everything runs in a single Python process served by uvicorn. There is no extern
 
 ## Rationale
 
-- **Self-hosted target:** A source installation can run a single application process. Adding Redis or a process supervisor doubles the ops burden for the primary audience.
+- **Self-hosted target:** Operators install with `pip install octop && octop init`. Adding Redis or a process supervisor doubles the ops burden for the primary audience.
 - **Workload profile:** Agent calls are LLM-bound (seconds to minutes of I/O wait). Python's asyncio handles this fan-out efficiently without threads or processes.
 - **SQLite is sufficient:** Concurrent writes are rare (one writer per agent at a time); WAL mode handles the load. Migrating to Postgres requires only a new `SqlitePool` implementation.
 - **Restart semantics are simple:** `OctopServer.start()` rebuilds the entire runtime tree from the SQLite file. No external state to reconcile.

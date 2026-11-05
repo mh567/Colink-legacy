@@ -1,8 +1,6 @@
 import { lazy } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 
-const ContactsPage = lazy(() => import("../pages/Contacts"));
-
 // Lazy-loaded pages — Common
 const ExpertsPage = lazy(() => import("../pages/Experts"));
 const CronJobsPage = lazy(() => import("../pages/Control/CronJobs"));
@@ -10,8 +8,6 @@ const ConnectorsPage = lazy(() => import("../pages/Agent/Connectors"));
 const SkillPackagesPage = lazy(() => import("../pages/SkillPackages"));
 const KnowledgeBasesPage = lazy(() => import("../pages/KnowledgeBases"));
 const BridgePage = lazy(() => import("../pages/Settings/Bridge"));
-const DevicesPage = lazy(() => import("../pages/Settings/Devices"));
-const LocalWorkspacePage = lazy(() => import("../pages/Settings/Workspace"));
 const PersonalizationPage = lazy(
   () => import("../pages/Agent/Personalization"),
 );
@@ -52,10 +48,6 @@ export interface RouteConfig {
 
 export const pathToKey: Record<string, string> = {
   "/chat": "chat",
-  "/settings/workspace": "local-workspace",
-  "/messages": "contacts",
-  "/contacts": "contacts",
-  "/admin/departments": "admin-users",
   // Common
   "/experts": "experts",
   "/tasks": "tasks",
@@ -106,8 +98,6 @@ export const pathToKey: Record<string, string> = {
  * Pages that should fill the entire content area without padding/scroll wrapper.
  */
 export const FULLSCREEN_PATHS = new Set([
-  "/messages",
-  "/contacts",
   "/workbench",
   "/workbench/terminal",
   "/workbench/browser",
@@ -146,8 +136,6 @@ export function isPersonalizationPath(pathname: string): boolean {
 
 export function resolveSelectedKey(pathname: string): string {
   if (pathToKey[pathname]) return pathToKey[pathname];
-  if (pathname.startsWith("/messages/") || pathname.startsWith("/contacts/"))
-    return "contacts";
   if (pathname.startsWith("/chat/")) return "chat";
   if (pathname.startsWith("/workbench/")) return "workbench";
   if (pathname.startsWith("/remote-desktop/")) return "remote-desktop";
@@ -156,16 +144,6 @@ export function resolveSelectedKey(pathname: string): string {
 }
 
 export const routeConfigs: RouteConfig[] = [
-  { path: "/settings/workspace", element: <LocalWorkspacePage /> },
-  { path: "/devices", element: <DevicesPage /> },
-  { path: "/messages", element: <ContactsPage /> },
-  { path: "/messages/:conversationId", element: <ContactsPage /> },
-  { path: "/contacts", element: <ContactsPage /> },
-  { path: "/contacts/:personId", element: <ContactsPage /> },
-  {
-    path: "/admin/departments",
-    element: <Navigate to="/admin/users?tab=departments" replace />,
-  },
   // Chat (handled via ChatWithKey wrapper in MainLayout)
   { path: "/chat", element: null, useWrapper: true },
   { path: "/chat/:agentId", element: null, useWrapper: true },

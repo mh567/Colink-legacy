@@ -27,55 +27,47 @@ async function probeUpdateStatus(): Promise<UpdateStatus | null> {
   return inFlight;
 }
 
-export function useUpdateStatus(enabled = true) {
+export function useUpdateStatus() {
   const [status, setStatus] = useState<UpdateStatus | null>(() =>
-    enabled ? readStoredUpdateStatus() : null,
+    readStoredUpdateStatus(),
   );
 
-  const refreshStatus = useCallback(
-    async (force = false) => {
-      if (!enabled) return;
-      if (!force && !isUpdateStatusCacheExpired()) {
-        const cached = readStoredUpdateStatus();
-        if (cached) {
-          setStatus(cached);
-          return;
-        }
+  const refreshStatus = useCallback(async (force = false) => {
+    if (!force && !isUpdateStatusCacheExpired()) {
+      const cached = readStoredUpdateStatus();
+      if (cached) {
+        setStatus(cached);
+        return;
       }
-      const next = await probeUpdateStatus();
-      if (next) setStatus(next);
-    },
-    [enabled],
-  );
+    }
+    const next = await probeUpdateStatus();
+    if (next) setStatus(next);
+  }, []);
 
   useEffect(() => {
-    if (!enabled) return;
     // Dashboard boot: always re-fetch so a restarted server is not hidden
     // by a still-fresh localStorage entry. Focus / interval still honor TTL.
     void refreshStatus(true);
-  }, [enabled, refreshStatus]);
+  }, [refreshStatus]);
 
   useEffect(() => {
-    if (!enabled) return;
     const onFocus = () => {
       void refreshStatus(false);
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [enabled, refreshStatus]);
+  }, [refreshStatus]);
 
   // Keep checking while the dashboard stays open (cache TTL still gates PyPI).
   useEffect(() => {
-    if (!enabled) return;
     const id = window.setInterval(() => {
       void refreshStatus(false);
     }, UPDATE_STATUS_POLL_MS);
     return () => window.clearInterval(id);
-  }, [enabled, refreshStatus]);
+  }, [refreshStatus]);
 
   // Sync Header / Sidebar / Update page when any writer stores a new status.
   useEffect(() => {
-    if (!enabled) return;
     const onChanged = (event: Event) => {
       const next = (event as CustomEvent<UpdateStatus>).detail;
       if (next) setStatus(next);
@@ -83,11 +75,9 @@ export function useUpdateStatus(enabled = true) {
     window.addEventListener(UPDATE_STATUS_CHANGED_EVENT, onChanged);
     return () =>
       window.removeEventListener(UPDATE_STATUS_CHANGED_EVENT, onChanged);
-  }, [enabled]);
+  }, []);
 
-  const hasUpdate = Boolean(
-    enabled && status?.has_update && status?.latest_version,
-  );
+  const hasUpdate = Boolean(status?.has_update && status?.latest_version);
 
-  return { status: enabled ? status : null, hasUpdate, refreshStatus };
+  return { status, hasUpdate, refreshStatus };
 }

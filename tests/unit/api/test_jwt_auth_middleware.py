@@ -17,6 +17,7 @@ from octop.api.deps import (
     maybe_sliding_renew_token,
     sign_token,
 )
+from octop.infra.auth.tokens import PURPOSE_ACCESS
 from octop.infra.server import OctopServer
 
 
@@ -26,6 +27,12 @@ def test_exempt_paths() -> None:
     assert is_jwt_exempt_path("/api/setup/status")
     assert is_jwt_exempt_path("/api/auth/login")
     assert is_jwt_exempt_path("/api/auth/captcha")
+    assert is_jwt_exempt_path("/api/auth/mfa/verify")
+    assert is_jwt_exempt_path("/api/auth/mfa/passkey/options")
+    assert is_jwt_exempt_path("/api/auth/passkey/status")
+    assert is_jwt_exempt_path("/api/auth/passkey/login/options")
+    assert is_jwt_exempt_path("/api/auth/passkey/login/verify")
+    assert not is_jwt_exempt_path("/api/auth/mfa/status")
     assert is_jwt_exempt_path("/api/auth/oidc/status")
     assert is_jwt_exempt_path("/api/auth/oidc/start")
     assert is_jwt_exempt_path("/api/auth/oidc/callback")
@@ -38,6 +45,7 @@ def test_exempt_paths() -> None:
     assert is_jwt_exempt_path("/api/auth/invite/redeem")
     assert is_jwt_exempt_path("/api/docs")
     assert is_jwt_exempt_path("/api/openapi.json")
+    assert is_jwt_exempt_path("/api/downloads/link/abc")
     assert not is_jwt_exempt_path("/api/auth/oidc/config")
     assert not is_jwt_exempt_path("/api/auth/oauth/providers/feishu")
     assert not is_jwt_exempt_path("/api/auth/oauth/bind/start")
@@ -45,6 +53,7 @@ def test_exempt_paths() -> None:
     assert not is_jwt_exempt_path("/api/auth/oidc/config/test")
     assert not is_jwt_exempt_path("/api/auth/me")
     assert not is_jwt_exempt_path("/api/agents")
+    assert not is_jwt_exempt_path("/api/downloads/link")
 
 
 @pytest.fixture
@@ -112,12 +121,13 @@ async def test_near_expiry_token_gets_sliding_renew(client) -> None:
     assert user is not None
     secret = srv.services.secret_repo.get("jwt")
     assert secret is not None
-    # Remaining life (~60s) is far below default TTL/3 (~8h) → renew.
+    # Remaining life (~60s) is below two-thirds of the default TTL → renew.
     short = sign_token(
         secret,
         sub=user.id,
         uname=user.username,
         role=user.role,
+        purpose=PURPOSE_ACCESS,
         ttl_seconds=60,
     )
     r = await c.get("/api/auth/me", headers=bearer(short))
@@ -126,7 +136,6 @@ async def test_near_expiry_token_gets_sliding_renew(client) -> None:
     assert renewed
     assert renewed != short
     payload = decode_token(secret, renewed)
-    assert payload["sid"] == decode_token(secret, short)["sid"]
     assert int(payload["exp"]) - int(payload["iat"]) == srv.services.config.access_token_ttl_seconds
 
 
@@ -140,51 +149,93 @@ async def test_maybe_sliding_renew_helper_threshold(client) -> None:
     secret = srv.services.secret_repo.get("jwt")
     assert secret is not None
     ttl = srv.services.config.access_token_ttl_seconds
-    fresh = sign_token(secret, sub=user.id, uname=user.username, role=user.role, ttl_seconds=ttl)
+    fresh = sign_token(
+        secret,
+        sub=user.id,
+        uname=user.username,
+        role=user.role,
+        purpose=PURPOSE_ACCESS,
+        ttl_seconds=ttl,
+    )
     assert maybe_sliding_renew_token(srv, fresh, user) is None
-    short = sign_token(secret, sub=user.id, uname=user.username, role=user.role, ttl_seconds=60)
+    short = sign_token(
+        secret,
+        sub=user.id,
+        uname=user.username,
+        role=user.role,
+        purpose=PURPOSE_ACCESS,
+        ttl_seconds=60,
+    )
     renewed = maybe_sliding_renew_token(srv, short, user)
     assert renewed is not None
     assert renewed != short
+    # Halfway through the TTL is inside the renew window (remaining < 2/3).
+    # Four-fifths remaining is still outside it.
+    halfway = sign_token(
+        secret,
+        sub=user.id,
+        uname=user.username,
+        role=user.role,
+        purpose=PURPOSE_ACCESS,
+        ttl_seconds=ttl // 2,
+    )
+    assert maybe_sliding_renew_token(srv, halfway, user) is not None
+    mostly_fresh = sign_token(
+        secret,
+        sub=user.id,
+        uname=user.username,
+        role=user.role,
+        purpose=PURPOSE_ACCESS,
+        ttl_seconds=(ttl * 4) // 5,
+    )
+    assert maybe_sliding_renew_token(srv, mostly_fresh, user) is None
 
 
-@pytest.mark.parametrize("role", ["admin", "user"])
-@pytest.mark.parametrize("legacy", [False, True])
-async def test_logout_revokes_main_api_and_renewed_session(client, role, legacy) -> None:
-    import jwt
-
-    from octop.api.deps import resolve_user_from_token
-    from octop.infra.auth.tokens import session_id
-    from octop.infra.errors import OctopError
-
-    c, srv, home = client
+async def test_middleware_localizes_auth_errors_by_accept_language(client) -> None:
+    c, _srv, home = client
     await bootstrap_admin(c, home)
-    if role == "user":
-        await srv.user_manager.create(username="employee", password="TestPass12", role=role)
-    user = srv.user_manager.get("admin" if role == "admin" else "employee")
-    secret = srv.services.secret_repo.get("jwt")
-    short = sign_token(secret, sub=user.id, uname=user.username, role=role, ttl_seconds=60)
-    if legacy:
-        claims = decode_token(secret, short)
-        claims.pop("sid")
-        claims["sub"] = str(user.id)
-        short = jwt.encode(claims, secret, algorithm="HS256")
-    renewed = (await c.get("/api/auth/me", headers=bearer(short))).headers[
-        ACCESS_TOKEN_RESPONSE_HEADER
-    ]
-    other_session = await login(c, username=user.username)
 
-    response = await c.post("/api/auth/logout", headers=bearer(short))
-    assert response.status_code == 204
-    assert ACCESS_TOKEN_RESPONSE_HEADER not in response.headers
-    for token in (short, renewed):
-        assert (await c.get("/api/auth/me", headers=bearer(token))).status_code == 401
-        with pytest.raises(OctopError):
-            resolve_user_from_token(srv, token)
-    assert (await c.get("/api/auth/me", headers=bearer(other_session))).status_code == 200
-    session = session_id(short, decode_token(secret, short))
-    with srv.services.db.connect() as conn:
-        expires = conn.execute(
-            "SELECT expires_at FROM communication_revoked_sessions WHERE session_id=?", (session,)
-        ).fetchone()["expires_at"]
-    assert expires >= decode_token(secret, renewed)["exp"]
+    # Missing credentials: zh / en / no header fallback.
+    r = await c.get("/api/agents", headers={"Accept-Language": "zh-CN,zh;q=0.9"})
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "AUTH_FAILED"
+    assert r.json()["error"]["message"] == "认证失败。"
+
+    r = await c.get("/api/agents", headers={"Accept-Language": "en-US,en;q=0.9"})
+    assert r.status_code == 401
+    assert r.json()["error"]["message"] == "Authentication failed."
+
+    r = await c.get("/api/agents")
+    assert r.status_code == 401
+    assert r.json()["error"]["message"] == "认证失败。"  # no header: DEFAULT_LOCALE (zh)
+
+    # Invalid token follows the same localization.
+    r = await c.get(
+        "/api/agents",
+        headers={"Authorization": "Bearer not-a-token", "Accept-Language": "zh-CN"},
+    )
+    assert r.status_code == 401
+    assert r.json()["error"]["message"] == "认证失败。"
+
+    # Expired token follows the same localization.
+    srv = _srv
+    assert srv.user_manager is not None and srv.services is not None
+    user = srv.user_manager.get("admin")
+    assert user is not None
+    secret = srv.services.secret_repo.get("jwt")
+    assert secret is not None
+    expired = sign_token(
+        secret,
+        sub=user.id,
+        uname=user.username,
+        role=user.role,
+        purpose=PURPOSE_ACCESS,
+        ttl_seconds=-3600,
+    )
+    r = await c.get(
+        "/api/agents",
+        headers={"Authorization": f"Bearer {expired}", "Accept-Language": "zh-CN"},
+    )
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "TOKEN_EXPIRED"
+    assert r.json()["error"]["message"] == "登录已过期，请重新登录。"

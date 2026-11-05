@@ -2,7 +2,6 @@ import { useMemo } from "react";
 import type { ResolvedModel, TokenUsage } from "../../../api/types";
 import { modelOptionValue, modelRef } from "../../../utils/modelOptions";
 import type { ChatMessage } from "./useChat";
-import { readContextBreakdown } from "../utils/contextUsage";
 
 const DEFAULT_MAX = 128_000;
 
@@ -100,12 +99,7 @@ export function useChatContextWindow(
     return null;
   }, [contextUsage, messages]);
 
-  const contextBreakdown = useMemo(
-    () => readContextBreakdown(contextUsage?.context_usage, contextMaxTokens),
-    [contextUsage, contextMaxTokens],
-  );
-
-  return { contextMaxTokens, contextUsedTokens, contextBreakdown };
+  return { contextMaxTokens, contextUsedTokens };
 }
 
 /** Build ``provider/model`` ref from an active-model API payload. */

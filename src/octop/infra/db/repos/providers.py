@@ -107,7 +107,7 @@ class ProviderRepo:
         self,
         provider_id: int,
         *,
-        kind: str | None = None,
+        kind: str | None | object = UNSET,
         base_url: str | None | object = UNSET,
         api_key: str | None | object = UNSET,
         extra_json: str | None | object = UNSET,
@@ -115,10 +115,11 @@ class ProviderRepo:
         note: str | None | object = UNSET,
         enabled: bool | None = None,
     ) -> None:
-        # ``None`` clears nullable columns. Omitted args stay ``UNSET`` and are
-        # skipped, so a note-only patch cannot wipe a stored API key.
+        # ``None`` clears the column. Omitted args stay ``UNSET`` and are skipped,
+        # so a note-only patch cannot wipe a stored API key.
         fields, params = optional_updates(
             [
+                ("kind", kind),
                 ("base_url", base_url),
                 ("api_key", api_key),
                 ("extra_json", extra_json),
@@ -126,9 +127,6 @@ class ProviderRepo:
                 ("note", note),
             ]
         )
-        if kind is not None:
-            fields.append("kind = ?")
-            params.append(kind)
         if enabled is not None:
             fields.append("enabled = ?")
             params.append(bool_int(enabled))

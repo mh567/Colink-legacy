@@ -4,6 +4,9 @@ import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 import path from "path";
 
+import { monacoSameOrigin } from "./vite/monaco.ts";
+import { suppressViteDisconnectReload } from "./vite/suppress-disconnect-reload.ts";
+
 // serialize-javascript@7 (pulled in by vite-plugin-pwa → @rollup/plugin-terser)
 // expects Web Crypto globals during `vite build`. Node <19 does not define them.
 if (typeof globalThis.crypto === "undefined") {
@@ -13,73 +16,22 @@ if (typeof globalThis.crypto === "undefined") {
   });
 }
 
-/**
- * Vite's `@vite/client` always opens a WebSocket. When that socket drops it
- * does `waitForSuccessfulPing` → `location.reload()`. On Safari + listen
- * port 80 (empty `location.port`) / LAN / `hmr: false`, the socket fails
- * repeatedly and the whole SPA looks like it is "periodically refreshing".
- *
- * `server.hmr: false` does NOT disable this client (Vite still uses the WS
- * for overlays / full-reload). Patch the disconnect path instead.
- */
-function suppressViteDisconnectReload(): Plugin {
-  return {
-    name: "octop-suppress-vite-disconnect-reload",
-    apply: "serve",
-    enforce: "pre",
-    transform(code, id) {
-      const isViteClient =
-        id.includes("vite/dist/client/client.mjs") ||
-        id.includes("vite/dist/client/client.js") ||
-        /(?:^|\/)@vite\/client(?:\?|$)/.test(id);
-      if (!isViteClient) return;
-      if (!code.includes("server connection lost")) return;
-
-      let next = code.replace(
-        /await waitForSuccessfulPing\(([^)]*)\);\s*location\.reload\(\);/g,
-        "await waitForSuccessfulPing($1); console.warn('[vite] WS restored; reload suppressed');",
-      );
-      // Fallback if formatting differs across Vite versions.
-      if (next === code && code.includes("location.reload()")) {
-        next = code.replace(
-          /console\.log\(`\[vite\] server connection lost\. Polling for restart\.\.\.`\);[\s\S]*?location\.reload\(\);/,
-          'console.warn("[vite] server connection lost (reload suppressed)"); return;',
-        );
-      }
-      if (next === code) return;
-      return { code: next, map: null };
-    },
-  };
+function normalizeViteBase(raw: string | undefined): string {
+  const value = (raw || "/").trim() || "/";
+  if (value === "/") return "/";
+  const withLeading = value.startsWith("/") ? value : `/${value}`;
+  return withLeading.endsWith("/") ? withLeading : `${withLeading}/`;
 }
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   // Empty = same-origin; frontend and backend served together, no hardcoded host.
   const apiBaseUrl = env.BASE_URL ?? "";
-  const desktopBundle = process.env.VITE_DESKTOP_BUNDLE === "1";
-  const staticCdnBase = desktopBundle
-    ? undefined
-    : process.env.VITE_STATIC_CDN_BASE?.trim();
-  if (desktopBundle && apiBaseUrl) {
-    throw new Error(
-      "Desktop bundles must use the selected server through the local API bridge",
-    );
-  }
-  if (staticCdnBase) {
-    const cdn = new URL(staticCdnBase);
-    if (
-      cdn.protocol !== "https:" ||
-      cdn.username ||
-      cdn.password ||
-      cdn.search ||
-      cdn.hash ||
-      !staticCdnBase.endsWith("/")
-    ) {
-      throw new Error(
-        "VITE_STATIC_CDN_BASE must be an HTTPS base URL ending in / without credentials, query or fragment",
-      );
-    }
-  }
+  // Subpath deploy (e.g. reverse-proxy ``/octop/``). Distinct from ``BASE_URL``
+  // (optional absolute API origin for local/dev splits).
+  const viteBase = normalizeViteBase(
+    process.env.VITE_BASE_PATH ?? env.VITE_BASE_PATH,
+  );
   // Allow overriding the backend port via VITE_API_PORT env variable (default: 8088)
   const apiPort = process.env.VITE_API_PORT ?? env.VITE_API_PORT ?? "8088";
 
@@ -112,7 +64,7 @@ export default defineConfig(({ mode }) => {
   }
 
   return {
-    base: staticCdnBase || "/",
+    base: viteBase,
     build: {
       outDir: path.resolve(__dirname, "../src/octop/dashboard"),
       emptyOutDir: true,
@@ -194,119 +146,110 @@ export default defineConfig(({ mode }) => {
       MOBILE: false,
     },
     plugins: [
+      monacoSameOrigin(__dirname),
       suppressViteDisconnectReload(),
       react(),
-      !desktopBundle &&
-        VitePWA({
-          // Service workers remain on the Octop origin even when assets use R2.
-          base: "/",
-          scope: "/",
-          // prompt: new SW stays in waiting until the user accepts via
-          // PwaUpdatePrompt → applyUpdate() → SKIP_WAITING. Avoid autoUpdate
-          // skipWaiting + page reload loops (especially Safari/WebKit).
-          registerType: "prompt",
-          // SW registration is handled in sw-register.ts for full control.
-          injectRegister: false,
-          // Use public/manifest.json directly instead of auto-generating one.
-          manifest: false,
-          // Include the offline fallback in the SW precache.
-          includeAssets: [
-            "offline.html",
-            "logo_vertical_dark.svg",
-            "logo_vertical_white.svg",
-            "logo_horizontal_dark.png",
-            "logo_horizontal_white.png",
-            "pwa-192.png",
-            "pwa-512.png",
-            "apple-touch-icon.png",
+      VitePWA({
+        // prompt: new SW stays in waiting until the user accepts via
+        // PwaUpdatePrompt → applyUpdate() → SKIP_WAITING. Avoid autoUpdate
+        // skipWaiting + page reload loops (especially Safari/WebKit).
+        registerType: "prompt",
+        // SW registration is handled in sw-register.ts for full control.
+        injectRegister: false,
+        // Use public/manifest.json directly instead of auto-generating one.
+        manifest: false,
+        // Include the offline fallback in the SW precache.
+        includeAssets: [
+          "offline.html",
+          "logo_vertical_dark.svg",
+          "logo_vertical_white.svg",
+          "logo_horizontal_dark.png",
+          "logo_horizontal_white.png",
+          "pwa-192.png",
+          "pwa-512.png",
+          "apple-touch-icon.png",
+        ],
+        workbox: {
+          // Precache hashed entry + vendor chunks. Do NOT precache index.html:
+          // Cache-First on the shell pins a stale HTML that points at deleted
+          // hashes after deploy (white screen until a hard refresh).
+          globPatterns: [
+            "assets/index.*.js",
+            "assets/vendor-*.js",
+            "assets/*.{css,woff2}",
           ],
-          workbox: {
-            modifyURLPrefix: staticCdnBase
-              ? { "assets/": `${staticCdnBase}assets/` }
-              : {},
-            // Precache hashed entry + vendor chunks. Do NOT precache index.html:
-            // Cache-First on the shell pins a stale HTML that points at deleted
-            // hashes after deploy (white screen until a hard refresh).
-            globPatterns: [
-              "assets/index.*.js",
-              "assets/vendor-*.js",
-              "assets/*.{css,woff2}",
-            ],
-            // vendor-antd (incl. the ColorPicker color engine) exceeds the
-            // 2 MiB workbox default; raise the precache limit so it stays
-            // offline-available instead of silently skipped.
-            maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
-            // FastAPI already serves the SPA fallback. A Workbox NavigationRoute
-            // would Cache-First the old shell; use NetworkFirst below instead.
-            navigateFallback: null,
-            // Take control on first activation so Chrome can fire beforeinstallprompt.
-            clientsClaim: true,
-            // Do not activate updated workers until the user confirms (SKIP_WAITING).
-            skipWaiting: false,
-            runtimeCaching: [
-              {
-                // Always revalidate the HTML shell so a new deploy is picked up
-                // without a hard refresh. Last good copy is kept for offline.
-                urlPattern: ({ request }) => request.mode === "navigate",
-                handler: "NetworkFirst",
-                options: {
-                  cacheName: "html-shell",
-                  networkTimeoutSeconds: 3,
-                  expiration: {
-                    maxEntries: 8,
-                    maxAgeSeconds: 24 * 60 * 60,
-                  },
+          // vendor-antd (incl. the ColorPicker color engine) exceeds the
+          // 2 MiB workbox default; raise the precache limit so it stays
+          // offline-available instead of silently skipped.
+          maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
+          // FastAPI already serves the SPA fallback. A Workbox NavigationRoute
+          // would Cache-First the old shell; use NetworkFirst below instead.
+          navigateFallback: null,
+          // Take control on first activation so Chrome can fire beforeinstallprompt.
+          clientsClaim: true,
+          // Do not activate updated workers until the user confirms (SKIP_WAITING).
+          skipWaiting: false,
+          runtimeCaching: [
+            {
+              // Always revalidate the HTML shell so a new deploy is picked up
+              // without a hard refresh. Last good copy is kept for offline.
+              urlPattern: ({ request }) => request.mode === "navigate",
+              handler: "NetworkFirst",
+              options: {
+                cacheName: "html-shell",
+                networkTimeoutSeconds: 3,
+                expiration: {
+                  maxEntries: 8,
+                  maxAgeSeconds: 24 * 60 * 60,
                 },
               },
-              {
-                // Vite emits content-hashed assets (assets/name.[hash].js).
-                // CacheFirst is correct: a new deploy uses new URLs.
-                // NetworkFirst would prefer a post-deploy 404 over the cache.
-                urlPattern: /\/assets\/.*\.(js|css)$/,
-                handler: "CacheFirst",
-                options: {
-                  cacheName: "static-chunks",
-                  expiration: {
-                    maxEntries: 200,
-                    maxAgeSeconds: 30 * 24 * 60 * 60,
-                  },
+            },
+            {
+              // Vite emits content-hashed assets (assets/name.[hash].js).
+              // CacheFirst is correct: a new deploy uses new URLs.
+              // NetworkFirst would prefer a post-deploy 404 over the cache.
+              urlPattern: /\/assets\/.*\.(js|css)$/,
+              handler: "CacheFirst",
+              options: {
+                cacheName: "static-chunks",
+                expiration: {
+                  maxEntries: 200,
+                  maxAgeSeconds: 30 * 24 * 60 * 60,
                 },
               },
-              {
-                // 3D model and animation files (GLB / GIF) — large, cache up to 7 days.
-                urlPattern: /\.(glb|gltf|gif)$/,
-                handler: "CacheFirst",
-                options: {
-                  cacheName: "3d-assets",
-                  expiration: {
-                    maxEntries: 60,
-                    maxAgeSeconds: 7 * 24 * 60 * 60,
-                  },
-                },
+            },
+            {
+              // 3D model and animation files (GLB / GIF) — large, cache up to 7 days.
+              urlPattern: /\.(glb|gltf|gif)$/,
+              handler: "CacheFirst",
+              options: {
+                cacheName: "3d-assets",
+                expiration: { maxEntries: 60, maxAgeSeconds: 7 * 24 * 60 * 60 },
               },
-              {
-                // Read-only API calls (chat history, files, config).
-                // NetworkFirst ensures fresh data when online; cache used offline.
-                urlPattern: /^\/api\/(chats|agent\/files|agent\/memory)/,
-                handler: "NetworkFirst",
-                options: {
-                  cacheName: "api-readonly",
-                  networkTimeoutSeconds: 5,
-                  expiration: { maxEntries: 50, maxAgeSeconds: 5 * 60 },
-                },
+            },
+            {
+              // Read-only API calls (chat history, files, config).
+              // NetworkFirst ensures fresh data when online; cache used offline.
+              urlPattern: /^\/api\/(chats|agent\/files|agent\/memory)/,
+              handler: "NetworkFirst",
+              options: {
+                cacheName: "api-readonly",
+                networkTimeoutSeconds: 5,
+                expiration: { maxEntries: 50, maxAgeSeconds: 5 * 60 },
               },
-              {
-                // Web fonts (woff2) — essentially permanent.
-                urlPattern: /\.woff2?$/,
-                handler: "CacheFirst",
-                options: {
-                  cacheName: "fonts",
-                  expiration: { maxAgeSeconds: 365 * 24 * 60 * 60 },
-                },
+            },
+            {
+              // Web fonts (woff2) — essentially permanent.
+              urlPattern: /\.woff2?$/,
+              handler: "CacheFirst",
+              options: {
+                cacheName: "fonts",
+                expiration: { maxAgeSeconds: 365 * 24 * 60 * 60 },
               },
-            ],
-          },
-        }),
+            },
+          ],
+        },
+      }),
       ...extraPlugins,
     ],
     css: {

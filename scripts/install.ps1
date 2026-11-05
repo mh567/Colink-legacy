@@ -1,5 +1,3 @@
-throw "Octop Enterprise: use source deployment from docker/enterprise/README.md. The upstream installer is disabled for this distribution."
-
 # Octop Installer for Windows (PowerShell)
 # Usage: irm <url>/install.ps1 | iex
 #    or: .\install.ps1 [-Version X.Y.Z] [-FromSource] [-SourceDir DIR] [-Extras "browser"]

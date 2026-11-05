@@ -11,6 +11,7 @@ import {
   Power,
   Sparkles,
 } from "lucide-react";
+import cx from "classnames";
 import {
   updateApi,
   UpdateStatus,
@@ -24,12 +25,11 @@ import {
 } from "../../../utils/updateStatusCache";
 import { TabPanelHeader } from "./TabPanelHeader";
 import styles from "./UpdateConfig.module.less";
-import ClientConfigPublish from "./ClientConfigPublish";
 
 /** Shell snippets shown in the manual upgrade guide (commands are locale-agnostic). */
 const UPGRADE_GUIDE_CODE = {
-  installerUnix: `curl -fsSL https://finnie-1258344699.cos.ap-guangzhou.myqcloud.com/octop/install.sh | bash`,
-  installerWin: `irm https://finnie-1258344699.cos.ap-guangzhou.myqcloud.com/octop/install.ps1 | iex`,
+  installerUnix: `curl -fsSL https://download.octop.cloud/octop/scripts/install.sh | bash`,
+  installerWin: `irm https://download.octop.cloud/octop/scripts/install.ps1 | iex`,
   cli: `octop update
 # or non-interactive:
 octop update --yes
@@ -111,7 +111,7 @@ function UpgradeGuide() {
 
   return (
     <section
-      className={`${styles.panel} ${styles.guide}`}
+      className={cx(styles.panel, styles.guide)}
       aria-label={t("advancedSettings.update.guideTitle")}
     >
       <div className={styles.panelTitleRow}>
@@ -316,39 +316,8 @@ export default function UpdateConfig() {
   const isServiceMode = !!status?.service_mode;
   const restartUiLocked = restartPhase !== "idle" && restartPhase !== "timeout";
 
-  // Do not show upstream installation commands while status is loading or
-  // when this distribution requires its own manually deployed releases.
-  if (!status || status.error_code === "manual_update_required") {
-    return (
-      <div className={styles.container}>
-        <ClientConfigPublish />
-        <TabPanelHeader
-          icon={<RefreshCw size={22} />}
-          title={t("advancedSettings.update.title")}
-          description={t("advancedSettings.update.manualDescription")}
-        />
-        <section
-          className={styles.panel}
-          aria-label={t("advancedSettings.update.manualTitle")}
-        >
-          <h3 className={styles.panelTitle}>
-            {t("advancedSettings.update.manualTitle")}
-          </h3>
-          <p className={styles.panelDesc}>
-            {t("advancedSettings.update.currentVersion")}:{" "}
-            {status?.current_version ?? "—"}
-          </p>
-          <p>{t("advancedSettings.update.manualBody")}</p>
-          <p>{t("advancedSettings.update.manualConfig")}</p>
-          <p>{t("advancedSettings.update.manualSource")}</p>
-        </section>
-      </div>
-    );
-  }
-
   return (
     <div className={styles.container}>
-      <ClientConfigPublish />
       <TabPanelHeader
         icon={<RefreshCw size={22} />}
         title={t("advancedSettings.update.title")}
@@ -425,7 +394,7 @@ export default function UpdateConfig() {
           </div>
 
           {status?.latest_is_prerelease && status.latest_version && (
-            <div className={`${styles.alert} ${styles.alertWarn}`}>
+            <div className={cx(styles.alert, styles.alertWarn)}>
               <AlertTriangle size={15} />
               <span>
                 {t("advancedSettings.update.prereleaseHint", {
@@ -436,14 +405,14 @@ export default function UpdateConfig() {
           )}
 
           {status?.is_editable && (
-            <div className={`${styles.alert} ${styles.alertWarn}`}>
+            <div className={cx(styles.alert, styles.alertWarn)}>
               <AlertTriangle size={15} />
               <span>{t("advancedSettings.update.editableHint")}</span>
             </div>
           )}
 
           {status?.error && (
-            <div className={`${styles.alert} ${styles.alertError}`}>
+            <div className={cx(styles.alert, styles.alertError)}>
               <XCircle size={15} />
               <span>
                 {status.error_code
@@ -456,7 +425,7 @@ export default function UpdateConfig() {
           )}
 
           {status?.source && status.source !== "pypi.org" && !status.error && (
-            <div className={`${styles.alert} ${styles.alertInfo}`}>
+            <div className={cx(styles.alert, styles.alertInfo)}>
               <Info size={15} />
               <span>
                 {t("advancedSettings.update.mirrorSource", {
@@ -529,7 +498,7 @@ export default function UpdateConfig() {
 
               {progress.status === "complete" && (
                 <>
-                  <div className={`${styles.alert} ${styles.alertSuccess}`}>
+                  <div className={cx(styles.alert, styles.alertSuccess)}>
                     <CheckCircle size={15} />
                     <span>
                       {t("advancedSettings.update.upgradeSuccess")}
@@ -540,7 +509,7 @@ export default function UpdateConfig() {
                   {restartPhase === "idle" &&
                     !status?.desktop &&
                     (isServiceMode ? (
-                      <div className={`${styles.alert} ${styles.alertInfo}`}>
+                      <div className={cx(styles.alert, styles.alertInfo)}>
                         <AlertTriangle size={15} />
                         <div className={styles.restartRow}>
                           <p>{t("advancedSettings.update.restartHint")}</p>
@@ -555,7 +524,7 @@ export default function UpdateConfig() {
                         </div>
                       </div>
                     ) : (
-                      <div className={`${styles.alert} ${styles.alertInfo}`}>
+                      <div className={cx(styles.alert, styles.alertInfo)}>
                         <AlertTriangle size={15} />
                         <div>
                           <p>{t("advancedSettings.update.restartHint")}</p>
@@ -571,7 +540,7 @@ export default function UpdateConfig() {
               )}
 
               {progress.status === "error" && (
-                <div className={`${styles.alert} ${styles.alertError}`}>
+                <div className={cx(styles.alert, styles.alertError)}>
                   <XCircle size={15} />
                   <div>
                     <p>

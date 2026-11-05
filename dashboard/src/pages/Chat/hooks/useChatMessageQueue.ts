@@ -1,4 +1,3 @@
-import type { DeviceSelection } from "@/api/modules/devices";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { generateId } from "../../../utils/messageParser";
 import type { ChatAttachment, UserComposerContext } from "./sseHelpers";
@@ -12,12 +11,10 @@ export type QueuedChatItem = {
   attachments?: ChatAttachment[];
   composerContext?: UserComposerContext;
   modelRef?: string | null;
-  device?: DeviceSelection | null;
   createdAt: number;
 };
 
 export type EnqueueChatItemInput = {
-  device?: DeviceSelection | null;
   text: string;
   attachments?: ChatAttachment[];
   composerContext?: UserComposerContext;
@@ -160,7 +157,6 @@ export function useChatMessageQueue({
           ? { ...input.composerContext }
           : undefined,
         modelRef: input.modelRef ?? null,
-        device: input.device ? { ...input.device } : null,
         createdAt: Date.now(),
       };
       writeQueues({ ...queuesRef.current, [key]: [...latest, item] });

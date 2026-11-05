@@ -1,1 +1,0 @@
-"""Company desktop channel tests."""

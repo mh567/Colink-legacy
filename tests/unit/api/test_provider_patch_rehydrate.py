@@ -24,11 +24,6 @@ def test_blank_api_key_clears_without_touching_other_fields() -> None:
     assert _provider_patch_updates(body, current_extra_json=None) == {"api_key": None}
 
 
-def test_revoke_with_null_kind_preserves_required_provider_kind() -> None:
-    body = ProviderPatchBody.model_validate({"kind": None, "api_key": None})
-    assert _provider_patch_updates(body, current_extra_json=None) == {"api_key": None}
-
-
 def test_note_only_patch_does_not_include_api_key() -> None:
     body = ProviderPatchBody.model_validate({"note": "ops memo"})
     assert _provider_patch_updates(body, current_extra_json='{"headers": {}}') == {

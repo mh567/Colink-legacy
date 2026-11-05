@@ -1,16 +1,3 @@
-import {
-  changedLocalArtifacts,
-  placeLocalArtifactTurns,
-} from "../utils/localArtifactTurns";
-import {
-  isCompanyDesktop,
-  createRuntimeTaskId,
-  requireDesktopRuntime,
-  runLocalTurn,
-  type LocalArtifact,
-  type RuntimeEvent,
-} from "@/api/desktopRuntime";
-import type { DeviceSelection } from "@/api/modules/devices";
 /**
  * Module-level chat store that survives React component unmount/remount cycles.
  *
@@ -22,18 +9,17 @@ import type { DeviceSelection } from "@/api/modules/devices";
 
 import { getApiUrl } from "../../../api/config";
 import { getAuthToken } from "../../../api/request";
-import { octopThreadsApi } from "../../../api/modules/octopThreads";
-import { isPendingThread } from "./useSessions";
 import type { TokenUsage } from "../../../api/types";
-import { contextUsageFromState } from "../utils/contextUsage";
+import { octopThreadsApi } from "../../../api/modules/octopThreads";
 import { buildDashboardChatWsUrl } from "../../../api/modules/wsChat";
 import { rewritePeerSpeakerId } from "../../../utils/remoteExpert";
 import { generateId } from "../../../utils/messageParser";
-import type {
-  ChatAttachment,
-  ChatMessage,
-  SessionSnapshot,
-  SessionStreamState,
+import {
+  parseDecisionNotice,
+  type ChatAttachment,
+  type ChatMessage,
+  type SessionSnapshot,
+  type SessionStreamState,
 } from "./sseHelpers";
 import {
   parseHarnessChunk,
@@ -65,6 +51,14 @@ import {
   promoteAskUserToolMessage,
 } from "../utils/pendingHitl";
 import { frameBelongsToThread } from "./frameThread";
+import { inFlightTail, preferLocalTranscript } from "../utils/mergeHistoryTail";
+import { clipThreadTitle } from "../utils/threadTitle";
+import {
+  clearInflightTail,
+  flushInflightTail,
+  moveInflightTail,
+  scheduleInflightTail,
+} from "../utils/inflightTranscriptCache";
 import {
   MAX_STREAM_RESUME_ATTEMPTS,
   STREAM_STALE_WITHOUT_SOCKET_MS,
@@ -111,6 +105,14 @@ export function setFocusedChatSession(sessionId: string | null): void {
   focusedChatSessionId = next;
   if (prev && prev !== next) {
     const prevState = sessionStates.get(prev);
+    if (
+      prevState &&
+      (prevState.isStreaming ||
+        prevState.messages.some((message) => message.status === "streaming") ||
+        prevState.messages.some((m) => m.localPending))
+    ) {
+      flushInflightTail(prev, inFlightTail(prevState.messages));
+    }
     // Listen sockets stay open after a turn so late team replies can land.
     // Leaving the room drops that idle bind; an in-flight turn keeps resume.
     if (!prevState?.isStreaming) {
@@ -286,36 +288,26 @@ const EMPTY_SNAPSHOT: SessionSnapshot = Object.freeze({
 });
 
 const sessionStates = new Map<string, SessionStreamState>();
-const editingLocalSessions = new Map<string, symbol>();
-/** Refreshing the webview must wait for all mounted conversations to be idle. */
-export function hasActiveChatWork(): boolean {
-  return (
-    editingLocalSessions.size > 0 ||
-    [...sessionStates.values()].some(
-      (state) =>
-        state.isStreaming ||
-        state.localPreparing ||
-        state.liveSpeakers.size > 0 ||
-        hasPendingHitl(state.messages),
-    )
-  );
-}
-const historyRevisions = new WeakMap<SessionStreamState, number>();
+let nextHistoryEpoch = 0;
 
-export function getHistoryRevision(sessionId: string): number {
-  const state = sessionStates.get(sessionId);
-  return state ? historyRevisions.get(state) ?? 0 : 0;
-}
-// Receipts outside the loaded history page still participate in legacy delta filtering.
-const localArtifactHistory = new WeakMap<SessionStreamState, LocalArtifact[]>();
-export function rememberLocalArtifactHistory(
-  sessionId: string,
-  files: LocalArtifact[],
-) {
-  const state = getOrCreate(sessionId);
-  if (!state.isStreaming) localArtifactHistory.set(state, files);
+function flushLiveInflight(): void {
+  for (const [sessionId, state] of sessionStates) {
+    const live =
+      state.isStreaming ||
+      state.liveSpeakers.size > 0 ||
+      state.messages.some((message) => message.status === "streaming") ||
+      state.messages.some((m) => m.localPending);
+    if (!live) continue;
+    flushInflightTail(sessionId, inFlightTail(state.messages));
+  }
 }
 
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", flushLiveInflight);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushLiveInflight();
+  });
+}
 /** Per-call samples let reconnects replace replayed usage instead of double-counting. */
 const usageSamplesByState = new WeakMap<
   SessionStreamState,
@@ -403,12 +395,19 @@ function emitSlashAction(event: SlashActionEvent) {
 }
 
 // Session lifecycle events (e.g. deletion) for cross-module bridging.
-export type SessionEventKind = "sessionDeleted" | "sessionsChanged";
+export type SessionEventKind =
+  | "sessionDeleted"
+  | "sessionsChanged"
+  | "sessionRenamed";
 export interface SessionEvent {
   kind: SessionEventKind;
   sessionId: string;
   /** Owning agent, when the event comes from a server push. */
   agentId?: string;
+  /** New thread title from a ``thread_title`` frame. */
+  title?: string;
+  /** Local clipped question shown until the server title arrives. */
+  provisional?: boolean;
 }
 type SessionEventListener = (event: SessionEvent) => void;
 const sessionEventListeners = new Set<SessionEventListener>();
@@ -431,11 +430,55 @@ export function emitSessionEvent(event: SessionEvent) {
   }
 }
 
+function applyThreadTitleFrame(data: Record<string, unknown>): boolean {
+  if (data.type !== "thread_title") return false;
+  const title = typeof data.title === "string" ? data.title.trim() : "";
+  const threadId =
+    typeof data.thread_id === "string" ? data.thread_id.trim() : "";
+  const agentId = typeof data.agent_id === "string" ? data.agent_id.trim() : "";
+  if (title && threadId) {
+    emitSessionEvent({
+      kind: "sessionRenamed",
+      sessionId: threadId,
+      title,
+      ...(agentId ? { agentId } : {}),
+    });
+  }
+  return true;
+}
+
+const TITLE_SETTLE_DELAYS_MS = [1000, 2000, 4000, 8000];
+
+/** Read the stored title after the socket that carried the turn has closed. */
+function settleGeneratedTitle(agentId: string, threadId: string): void {
+  if (!agentId || !threadId || threadId.startsWith("__")) return;
+  void (async () => {
+    for (const delay of TITLE_SETTLE_DELAYS_MS) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      try {
+        const rows = await octopThreadsApi.list(agentId, 50);
+        const title = rows
+          .find((row) => row.thread_id === threadId)
+          ?.title?.trim();
+        if (!title) continue;
+        emitSessionEvent({
+          kind: "sessionRenamed",
+          sessionId: threadId,
+          agentId,
+          title,
+        });
+        return;
+      } catch {
+        // The next attempt still covers a title that lands after this miss.
+      }
+    }
+  })();
+}
+
 function buildSnapshot(state: SessionStreamState): SessionSnapshot {
   return {
     messages: state.messages,
     isStreaming: state.isStreaming,
-    localPreparing: state.localPreparing ?? false,
     thinkingStartedAt: state.thinkingStartedAt,
     runUsage: state.runUsage,
     contextUsage: state.contextUsage,
@@ -508,7 +551,9 @@ function getOrCreate(sessionId: string): SessionStreamState {
   let state = sessionStates.get(sessionId);
   if (!state) {
     state = {
+      sessionKey: sessionId,
       messages: [],
+      historyEpoch: ++nextHistoryEpoch,
       isStreaming: false,
       thinkingStartedAt: null,
       runUsage: null,
@@ -534,26 +579,33 @@ function getOrCreate(sessionId: string): SessionStreamState {
     };
     sessionStates.set(sessionId, state);
   }
+  if (!state.sessionKey || !sessionId.startsWith("__")) {
+    state.sessionKey = sessionId;
+  }
   if (!state.pendingSteers) state.pendingSteers = [];
   return state;
 }
 
-const dirtyStreamSnapshots = new WeakSet<SessionStreamState>();
-const pendingStreamNotifications = new WeakMap<
+/**
+ * Token / reasoning paints. A fast stream used to call React on every
+ * fragment and starve in-flight fetches (expert profile, context usage).
+ * The snapshot stays current immediately; listeners flush on this interval.
+ */
+const STREAM_PAINT_MS = 50;
+
+const streamPaintTimers = new Map<
   SessionStreamState,
-  () => void
+  ReturnType<typeof setTimeout>
 >();
 
-function cancelStreamNotification(state: SessionStreamState): void {
-  pendingStreamNotifications.get(state)?.();
-  pendingStreamNotifications.delete(state);
+function cancelStreamPaint(state: SessionStreamState): void {
+  const timer = streamPaintTimers.get(state);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  streamPaintTimers.delete(state);
 }
 
-function notify(state: SessionStreamState) {
-  cancelStreamNotification(state);
-  dirtyStreamSnapshots.delete(state);
-  // Rebuild the snapshot reference so useSyncExternalStore sees the change.
-  state._snapshot = buildSnapshot(state);
+function publish(state: SessionStreamState): void {
   for (const fn of state.listeners) {
     try {
       fn();
@@ -563,17 +615,53 @@ function notify(state: SessionStreamState) {
   }
 }
 
-/** Apply every delta, but publish cumulative streaming state once per frame. */
-function notifyStream(state: SessionStreamState): void {
-  dirtyStreamSnapshots.add(state);
-  if (pendingStreamNotifications.has(state) || !state.listeners.size) return;
-  if (typeof requestAnimationFrame === "function") {
-    const frame = requestAnimationFrame(() => notify(state));
-    pendingStreamNotifications.set(state, () => cancelAnimationFrame(frame));
-  } else {
-    const timer = setTimeout(() => notify(state), 16);
-    pendingStreamNotifications.set(state, () => clearTimeout(timer));
+function rememberInflight(state: SessionStreamState): void {
+  const sessionId = state.sessionKey || "";
+  if (!sessionId || sessionId.startsWith("__")) return;
+  const live =
+    state.isStreaming ||
+    state.liveSpeakers.size > 0 ||
+    state.messages.some((message) => message.status === "streaming");
+  const tail = inFlightTail(state.messages);
+  if (live) {
+    scheduleInflightTail(sessionId, tail);
+    return;
   }
+  if (state.messages.some((m) => m.localPending)) {
+    flushInflightTail(sessionId, tail);
+  }
+}
+
+function notify(state: SessionStreamState) {
+  // Rebuild the snapshot reference so useSyncExternalStore sees the change.
+  cancelStreamPaint(state);
+  state._snapshot = buildSnapshot(state);
+  rememberInflight(state);
+  publish(state);
+}
+
+/** Coalesce high-frequency stream fragments onto one paint. */
+function notifyStreamingPaint(state: SessionStreamState): void {
+  state._snapshot = buildSnapshot(state);
+  rememberInflight(state);
+  if (streamPaintTimers.has(state)) return;
+  streamPaintTimers.set(
+    state,
+    setTimeout(() => {
+      streamPaintTimers.delete(state);
+      publish(state);
+    }, STREAM_PAINT_MS),
+  );
+}
+
+function chunkPaintsImmediately(type: string): boolean {
+  return (
+    type !== "token" &&
+    type !== "reasoning" &&
+    type !== "usage" &&
+    type !== "state_update" &&
+    type !== "state_snapshot"
+  );
 }
 
 function beginStream(state: SessionStreamState, sessionId: string): void {
@@ -590,7 +678,6 @@ function clearStreamingFlags(
   // Do not clear liveSpeakers — team members may keep generating after the
   // host turn unlocks the composer; process panels key off liveSpeakers.
   state.isStreaming = false;
-  state.localPreparing = false;
   state.thinkingStartedAt = null;
   if (opts?.keepSteer) return;
   state.activeTurnId = null;
@@ -611,7 +698,7 @@ type LiveSocket = {
    */
   intentionalClose: boolean;
   /**
-   * Stream controller aborted. Distinct from intentional socket *replace*
+   * User hit stop (or cancelStream). Distinct from intentional socket *replace*
    * while the server turn should keep running.
    */
   userCancelled: boolean;
@@ -639,15 +726,12 @@ function stopSocketPing(live: LiveSocket): void {
 }
 
 const liveSockets = new Map<string, LiveSocket>();
-const localStreams = new Set<string>();
-const localAttachmentImports = new Map<string, AbortController>();
 
 /** Last stream-related activity (chunk / open / status) for sticky seals. */
 const streamActivityAt = new Map<string, number>();
 const streamWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
 
 function isLiveSocketOpen(sessionId: string): boolean {
-  if (localStreams.has(sessionId)) return true;
   const live = liveSockets.get(sessionId);
   if (!live) return false;
   return (
@@ -658,7 +742,14 @@ function isLiveSocketOpen(sessionId: string): boolean {
 
 /** True when this session currently owns an open/connecting chat WebSocket. */
 export function hasLiveSocket(sessionId: string): boolean {
-  return isLiveSocketOpen(sessionId);
+  if (isLiveSocketOpen(sessionId)) return true;
+  if (!sessionId || sessionId === "__empty__" || sessionId === "__default__") {
+    return false;
+  }
+  for (const [key, live] of liveSockets) {
+    if (live.threadId === sessionId && isLiveSocketOpen(key)) return true;
+  }
+  return false;
 }
 
 function clearStreamWatchdog(sessionId: string): void {
@@ -726,19 +817,27 @@ function armStreamWatchdog(sessionId: string): void {
 export function subscribe(sessionId: string, listener: () => void): () => void {
   const state = getOrCreate(sessionId);
   state.listeners.add(listener);
-  if (dirtyStreamSnapshots.has(state)) notifyStream(state);
   return () => {
     state.listeners.delete(listener);
-    if (!state.listeners.size) cancelStreamNotification(state);
   };
+}
+
+/** Capture the session revision before an asynchronous history read. */
+export function beginHistoryRead(sessionId: string): number {
+  return getOrCreate(sessionId).historyEpoch ?? 0;
+}
+
+export function isHistoryReadCurrent(
+  sessionId: string,
+  epoch: number,
+): boolean {
+  return sessionStates.get(sessionId)?.historyEpoch === epoch;
 }
 
 /** Get a read-only snapshot of the session state (referentially stable). */
 export function getSnapshot(sessionId: string): SessionSnapshot {
   const state = sessionStates.get(sessionId);
   if (!state) return EMPTY_SNAPSHOT;
-  if (dirtyStreamSnapshots.delete(state))
-    state._snapshot = buildSnapshot(state);
   return state._snapshot;
 }
 
@@ -779,6 +878,19 @@ export function setHistoryPage(
   state.historyLoadingMore = false;
   state.historyHydrated = true;
   state.historyStale = false;
+  notify(state);
+}
+
+/** Put a cached in-flight tail back when it is longer than what is on screen. */
+export function restoreInflightTail(
+  sessionId: string,
+  tail: ChatMessage[],
+): void {
+  const state = sessionStates.get(sessionId);
+  if (!state || tail.length === 0) return;
+  const next = preferLocalTranscript(state.messages, tail);
+  if (next === state.messages) return;
+  state.messages = next;
   notify(state);
 }
 
@@ -836,37 +948,41 @@ export function setHistoryLoadingMore(sessionId: string, loading: boolean) {
 /** Append a user message to a session. */
 export function appendUserMessage(sessionId: string, msg: ChatMessage) {
   const state = getOrCreate(sessionId);
-  state.messages = [...state.messages, msg];
+  if (state.messages.some((m) => m.id === msg.id)) return;
+  state.messages = [...state.messages, { ...msg, localPending: true }];
   notify(state);
 }
 
 /**
  * Truncate all messages from messageId (inclusive) onwards, replacing that
  * message's content with newContent. Also aborts any in-flight stream.
- * Returns true if the message was found, false otherwise.
+ * Returns the new send's identity, or null if the message was not found.
  */
 export function truncateAndReplaceUserMessage(
   sessionId: string,
   messageId: string,
   newContent: string,
-): boolean {
+): string | null {
   const state = getOrCreate(sessionId);
   const idx = state.messages.findIndex((m) => m.id === messageId);
-  if (idx < 0) return false;
+  if (idx < 0) return null;
 
   // Abort any in-flight stream before rewriting history
   state.abortController?.abort();
   state.abortController = null;
 
   const original = state.messages[idx];
-  historyRevisions.set(state, getHistoryRevision(sessionId) + 1);
+  const replacementId = generateId();
+  state.historyEpoch = ++nextHistoryEpoch;
+  clearInflightTail(sessionId);
   state.messages = [
     ...state.messages.slice(0, idx),
     {
       ...original,
+      id: replacementId,
       content: newContent,
-      timestamp: Date.now(),
       status: "done" as const,
+      localPending: true,
     },
   ];
   clearStreamingFlags(state);
@@ -877,106 +993,7 @@ export function truncateAndReplaceUserMessage(
   state.streamBlockType = "";
   state.toolCallIdIndex = {};
   notify(state);
-  return true;
-}
-
-/** Finish the old native turn before replacing its server checkpoint. */
-export async function editLocalMessage(
-  sessionId: string,
-  messageId: string,
-  text: string,
-  agentId: string,
-): Promise<void> {
-  if (editingLocalSessions.has(sessionId)) return;
-  const state = getOrCreate(sessionId);
-  if (!state.messages.some((m) => m.id === messageId && m.role === "user"))
-    return;
-  const editToken = Symbol();
-  editingLocalSessions.set(sessionId, editToken);
-  historyRevisions.set(state, getHistoryRevision(sessionId) + 1);
-  const wasStreaming = state.isStreaming;
-  if (!wasStreaming) {
-    beginStream(state, sessionId);
-    state.localPreparing = true;
-    notify(state);
-  }
-  try {
-    const runtime = requireDesktopRuntime();
-    const status = await runtime.status();
-    if (!status.capabilities?.includes("edit_message")) {
-      throw new Error("请安装新版企业客户端后使用编辑重发，原消息已保留。");
-    }
-    const task = status.active_tasks.find(
-      (item) => item.thread_id === sessionId,
-    );
-    if (task && ["running", "cancel_requested"].includes(task.status ?? "")) {
-      await new Promise<void>((resolve, reject) => {
-        const finish = (error?: Error) => {
-          clearTimeout(timer);
-          unsubscribe();
-          if (error) reject(error);
-          else resolve();
-        };
-        const unsubscribe = runtime.subscribe((event) => {
-          if (
-            event.thread_id === sessionId &&
-            event.event === "done" &&
-            (!event.task_id || event.task_id === task.task_id)
-          ) {
-            finish(
-              event.status === "unknown"
-                ? new Error("原任务停止结果待核对，请稍后重试编辑。")
-                : undefined,
-            );
-          }
-        });
-        const timer = setTimeout(
-          () => finish(new Error("仍在等待原任务停止，原消息已保留。")),
-          15000,
-        );
-        void runtime
-          .cancel({ thread_id: sessionId })
-          .then((reply) => {
-            if (["not_running", "inactive", "not_found"].includes(reply.status))
-              finish();
-          })
-          .catch((error: unknown) =>
-            finish(
-              error instanceof Error ? error : new Error("原任务停止失败"),
-            ),
-          );
-      });
-      // Let the previous subscription finalize before the next one is opened.
-      await Promise.resolve();
-    }
-    await sendTurn(
-      sessionId,
-      text,
-      agentId,
-      "",
-      state.messages.find((message) => message.id === messageId)?.attachments,
-      undefined,
-      undefined,
-      sessionId,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      messageId,
-    );
-  } finally {
-    if (editingLocalSessions.get(sessionId) === editToken) {
-      editingLocalSessions.delete(sessionId);
-    }
-    if (!wasStreaming && !state.abortController) {
-      clearStreamingFlags(state);
-      notify(state);
-    }
-  }
+  return replacementId;
 }
 
 /** Append a push (proactive/cron) assistant message to all active sessions. */
@@ -1004,6 +1021,7 @@ export function clearMessages(sessionId: string) {
   // the socket keeps streaming into this state and the UI needs it on return.
   // An idle listen socket (team follow-ups) must not block a clear.
   if (state.isStreaming) return;
+  state.historyEpoch = ++nextHistoryEpoch;
   const alreadyEmpty =
     state.messages.length === 0 &&
     !state.isStreaming &&
@@ -1026,6 +1044,7 @@ export function clearMessages(sessionId: string) {
   state.historyLoadingMore = false;
   state.historyHydrated = false;
   state.historyStale = false;
+  clearInflightTail(sessionId);
   notify(state);
 }
 
@@ -1061,61 +1080,53 @@ function closeLiveSocket(
   } catch {
     // ignore
   }
-  clearLiveSocket(sessionId);
+  clearLiveSocket(sessionId, live.ws);
 }
 
-/** Request cancellation without closing the stream or claiming completion. */
-export async function cancelStream(sessionId: string, agentId: string) {
-  if (isCompanyDesktop()) {
-    const importing = localAttachmentImports.get(sessionId);
-    if (
-      importing &&
-      sessionStates.get(sessionId)?.abortController === importing
-    ) {
-      importing.abort();
-      return { thread_id: sessionId, requested: true };
-    }
-    const result = await requireDesktopRuntime().cancel({
-      thread_id: sessionId,
-    });
-    return {
-      thread_id: sessionId,
-      requested: !["inactive", "not_found", "not_running"].includes(
-        result.status,
-      ),
-    };
+/** Cancel any in-flight stream for a session (user stop). */
+export function cancelStream(sessionId: string) {
+  const state = sessionStates.get(sessionId);
+  if (!state) return;
+  const live = liveSockets.get(sessionId);
+  if (live) {
+    live.intentionalClose = true;
+    live.userCancelled = true;
+    sendCancelFrame(live.ws, live.threadId || sessionId);
   }
-  const threadId = liveSockets.get(sessionId)?.threadId || sessionId;
-  if (
-    !agentId ||
-    !threadId ||
-    threadId === "__empty__" ||
-    isPendingThread(threadId)
-  ) {
-    throw new Error("No server thread is available to cancel");
+  const hadAbort = Boolean(state.abortController);
+  const hadStreaming = state.isStreaming;
+  const hadStreamingMsgs = state.messages.some((m) => m.status === "streaming");
+  const hadLive = state.liveSpeakers.size > 0;
+  state.abortController?.abort();
+  state.abortController = null;
+  clearStreamingFlags(state);
+  clearAllLiveSpeakers(state);
+  clearStreamActivity(sessionId);
+  pendingResumeBySession.delete(sessionId);
+  state.runUsage = null;
+  usageSamplesByState.delete(state);
+  if (hadStreamingMsgs) {
+    state.messages = state.messages.map((m) =>
+      m.status === "streaming" ? { ...m, status: "done" as const } : m,
+    );
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-  try {
-    return await octopThreadsApi.cancel(agentId, threadId, controller.signal);
-  } finally {
-    clearTimeout(timeout);
+  if (hadAbort || hadStreaming || hadStreamingMsgs || hadLive) {
+    notify(state);
   }
 }
 
 /** Remove a session from the cache entirely. */
 export function removeSession(sessionId: string) {
-  localRuntimeAttachments.get(sessionId)?.();
   const state = sessionStates.get(sessionId);
   if (state) {
-    cancelStreamNotification(state);
-    dirtyStreamSnapshots.delete(state);
+    cancelStreamPaint(state);
     state.abortController?.abort();
     sessionStates.delete(sessionId);
   }
   pendingResumeBySession.delete(sessionId);
   clearStreamActivity(sessionId);
   clearStreamWatchdog(sessionId);
+  clearInflightTail(sessionId);
   closeLiveSocket(sessionId, { intentional: true, userCancelled: true });
 }
 
@@ -1165,6 +1176,8 @@ export function renameSessionKey(oldId: string, newId: string) {
     if (focusedChatSessionId === oldId) {
       focusedChatSessionId = newId;
     }
+    state.sessionKey = newId;
+    moveInflightTail(oldId, newId);
     // Notify listeners so that components subscribed under the new key
     // (after a navigate) immediately see the existing messages.
     notify(state);
@@ -1203,16 +1216,62 @@ export function debugDump() {
 function updateContextUsageFromChunk(
   state: SessionStreamState,
   chunk: { data: unknown },
-): boolean {
+): void {
   const data = chunk.data;
-  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
-  const usage = contextUsageFromState(
-    (data as { messages?: unknown[] }).messages,
-  );
-  if (!usage || JSON.stringify(usage) === JSON.stringify(state.contextUsage))
-    return false;
-  state.contextUsage = usage;
-  return true;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return;
+  const messages = (data as { messages?: unknown[] }).messages;
+  if (!Array.isArray(messages) || messages.length === 0) return;
+
+  const last = messages[messages.length - 1] as Record<string, unknown>;
+  const usageMeta = last.usage_metadata;
+  if (!usageMeta || typeof usageMeta !== "object" || Array.isArray(usageMeta))
+    return;
+
+  const meta = usageMeta as Record<string, unknown>;
+  const input =
+    typeof meta.input_tokens === "number"
+      ? meta.input_tokens
+      : typeof meta.prompt_tokens === "number"
+      ? meta.prompt_tokens
+      : null;
+  if (input !== null && input > 0) {
+    state.contextUsage = { input_tokens: input };
+  }
+  attachDecisionSaved(state, messages);
+}
+
+function decisionSavedOnMessage(message: Record<string, unknown>): number {
+  const kwargs = message.additional_kwargs;
+  if (!kwargs || typeof kwargs !== "object" || Array.isArray(kwargs)) return 0;
+  const ctx = (kwargs as Record<string, unknown>).context_usage;
+  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return 0;
+  return usageCount((ctx as Record<string, unknown>).decision_saved);
+}
+
+function attachDecisionSaved(
+  state: SessionStreamState,
+  messages: unknown[],
+): void {
+  const samples = usageSamplesByState.get(state);
+  if (!samples) return;
+  let changed = false;
+  for (const item of messages) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const message = item as Record<string, unknown>;
+    const saved = decisionSavedOnMessage(message);
+    const id = typeof message.id === "string" ? message.id : "";
+    if (saved <= 0 || !id || !samples.has(id)) continue;
+    const current = samples.get(id);
+    if (!current || usageCount(current.decision_saved) === saved) continue;
+    samples.set(id, { ...current, decision_saved: saved });
+    changed = true;
+  }
+  if (!changed || !state.runUsage) return;
+  let total = 0;
+  for (const sample of samples.values()) {
+    total += usageCount(sample.decision_saved);
+  }
+  state.runUsage = { ...state.runUsage, decision_saved: total };
 }
 
 function usageCount(value: unknown): number {
@@ -1228,7 +1287,13 @@ function applyUsageChunk(state: SessionStreamState, chunk: UsageChunk): void {
       samples = new Map();
       usageSamplesByState.set(state, samples);
     }
-    samples.set(chunk.call_id, chunk.usage);
+    const previousSample = samples.get(chunk.call_id);
+    samples.set(chunk.call_id, {
+      ...chunk.usage,
+      decision_saved:
+        usageCount(chunk.usage.decision_saved) ||
+        usageCount(previousSample?.decision_saved),
+    });
     const latestInput = usageCount(chunk.usage.input_tokens);
     state.runUsage = Array.from(samples.values()).reduce<TokenUsage>(
       (total, usage) => {
@@ -1253,6 +1318,8 @@ function applyUsageChunk(state: SessionStreamState, chunk: UsageChunk): void {
             usageCount(total.total_tokens) +
             usageCount(usage.total_tokens || input + output),
           model_calls: usageCount(total.model_calls) + 1,
+          decision_saved:
+            usageCount(total.decision_saved) + usageCount(usage.decision_saved),
           last_input_tokens: latestInput,
         };
       },
@@ -1285,6 +1352,8 @@ function applyUsageChunk(state: SessionStreamState, chunk: UsageChunk): void {
       usageCount(previous.total_tokens) +
       usageCount(usage.total_tokens || input + output),
     model_calls: usageCount(previous.model_calls) + 1,
+    decision_saved:
+      usageCount(previous.decision_saved) + usageCount(usage.decision_saved),
     last_input_tokens: input,
   };
   state.contextUsage = { input_tokens: input };
@@ -1327,6 +1396,20 @@ function isHostTurnTerminal(
 /** Persist whether this session is a team host room (listen-only / ask_agent). */
 export function setSessionTeamRoom(sessionId: string, isTeam: boolean): void {
   getOrCreate(sessionId).isTeamRoom = isTeam;
+}
+
+/** Keep the dashboard socket after host ``turn.ended``.
+ *
+ * Team rooms need it for member replies. Bridge rooms need it even when the
+ * shadow agent is not flagged ``kind: team``, because closing the socket
+ * unlistens the peer before members flush.
+ */
+function keepRoomSocket(
+  state: SessionStreamState,
+  agentId?: string | null,
+): boolean {
+  if (state.isTeamRoom) return true;
+  return Boolean(agentId?.startsWith("bridge:"));
 }
 
 function sessionHostAgentId(
@@ -1383,16 +1466,19 @@ function handleHarnessChunk(
   switch (chunk.type) {
     case "token": {
       const snapshot = Boolean(chunk.team_snapshot);
-      // Snapshots are complete wall copies — never leave the speaker "live".
-      if (!snapshot) markSpeakerLive(state, speaker);
+      const liveCatchup = snapshot && Boolean(chunk.team_live);
+      // A finished snapshot is a complete wall copy. A live catchup is the
+      // text already spoken when the page refreshes; the member is still talking.
+      if (!snapshot || liveCatchup) markSpeakerLive(state, speaker);
       appendStreamingToken(
         state,
         chunk.content,
         speaker,
         snapshot,
         Boolean(chunk.team_wrapup),
+        liveCatchup,
       );
-      if (snapshot) clearSpeakerLive(state, speaker);
+      if (snapshot && !liveCatchup) clearSpeakerLive(state, speaker);
       break;
     }
     case "reasoning":
@@ -1419,7 +1505,7 @@ function handleHarnessChunk(
             : "";
         state.pendingPlanPath = pending || null;
       }
-      if (chunk.team_wrapup) {
+      if (Boolean(chunk.team_wrapup)) {
         finalizeWrapupMessages(state, speaker);
         clearSpeakerLive(state, speaker);
         // Wrap-up means members already finished — drop stale live bits
@@ -1445,6 +1531,9 @@ function handleHarnessChunk(
         speaker,
         sessionHostAgentId(state, sessionId),
       );
+      if (typeof chunk.duration_ms === "number") {
+        stampTurnDuration(state, chunk.duration_ms, speaker, sessionId);
+      }
       clearSpeakerLive(state, speaker);
       // Host done seals the segment. When a logical steer turn is still
       // active, keep isStreaming / activeTurnId so 排队 stays available and
@@ -1525,23 +1614,112 @@ function handleHarnessChunk(
     }
     case "state_update":
     case "state_snapshot":
-      if (!updateContextUsageFromChunk(state, chunk)) return;
+      updateContextUsageFromChunk(state, chunk);
       break;
     case "custom":
-      // Debug-only — phase 15 will add a debug toggle that surfaces these.
-      return;
+      // Decision runs on the host model call and the frame has no speaker.
+      // In a team room an unlabeled chip would sit on its own invisible turn.
+      // A wrap-up evaluation is a new host turn, not a rewrite of the dispatch.
+      applyDecisionNotice(
+        state,
+        chunk.data,
+        speaker ||
+          (state.isTeamRoom ? sessionHostAgentId(state, sessionId) : undefined),
+        Boolean(chunk.team_wrapup),
+      );
+      break;
   }
-  if (
-    [
-      "token",
-      "reasoning",
-      "tool_call_chunk",
-      "state_update",
-      "state_snapshot",
-    ].includes(chunk.type)
-  )
-    notifyStream(state);
-  else notify(state);
+  if (chunkPaintsImmediately(chunk.type)) notify(state);
+  else notifyStreamingPaint(state);
+}
+
+/** Attach the latest decision result to this turn. One chip, updated in place. */
+function applyDecisionNotice(
+  state: SessionStreamState,
+  data: unknown,
+  speakerAgentId?: string,
+  wrapup = false,
+): void {
+  const notice = parseDecisionNotice(data);
+  if (!notice) return;
+  const speaker = speakerAgentId?.trim() || undefined;
+  const hostId = sessionHostAgentId(state);
+  const teamRoom = Boolean(state.isTeamRoom);
+  for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+    const message = state.messages[index];
+    if (message.role === "user") break;
+    if (message.role !== "assistant" || message.toolData || message.hitlData) {
+      continue;
+    }
+    if (wrapup ? !message.teamWrapup : Boolean(message.teamWrapup)) continue;
+    if (
+      !sameStreamingSpeaker(message.speakerAgentId, speaker, hostId, teamRoom)
+    ) {
+      continue;
+    }
+    if (!message.decision) continue;
+    state.messages = [
+      ...state.messages.slice(0, index),
+      { ...message, decision: notice },
+      ...state.messages.slice(index + 1),
+    ];
+    return;
+  }
+  if (wrapup) {
+    const wrapIdx = findWrapupTextToContinue(state.messages, speaker, hostId);
+    if (wrapIdx >= 0) {
+      const target = state.messages[wrapIdx];
+      state.messages = [
+        ...state.messages.slice(0, wrapIdx),
+        { ...target, decision: notice },
+        ...state.messages.slice(wrapIdx + 1),
+      ];
+      return;
+    }
+    markSpeakerLive(state, speaker);
+    state.messages = [
+      ...state.messages,
+      {
+        id: generateId(),
+        role: "assistant",
+        content: "",
+        status: "streaming",
+        timestamp: Date.now(),
+        speakerAgentId: speaker,
+        teamWrapup: true,
+        decision: notice,
+      },
+    ];
+    return;
+  }
+  const idx = findSpeakerTextToContinue(
+    state.messages,
+    speaker,
+    hostId,
+    continueTokenOpts(state),
+  );
+  if (idx >= 0) {
+    const target = state.messages[idx];
+    state.messages = [
+      ...state.messages.slice(0, idx),
+      { ...target, decision: notice },
+      ...state.messages.slice(idx + 1),
+    ];
+    return;
+  }
+  markSpeakerLive(state, speaker);
+  state.messages = [
+    ...state.messages,
+    {
+      id: generateId(),
+      role: "assistant",
+      content: "",
+      status: "streaming",
+      timestamp: Date.now(),
+      speakerAgentId: speaker,
+      decision: notice,
+    },
+  ];
 }
 
 /** Apply one live harness frame (used by WS and unit tests). */
@@ -1578,12 +1756,9 @@ function findWrapupTextToContinue(
     const message = messages[i];
     if (message.role === "user") break;
     if (message.role !== "assistant" || message.toolData) continue;
+    if (!message.teamWrapup) continue;
     if (!sameStreamingSpeaker(message.speakerAgentId, speaker, hostId, true))
       continue;
-    // A subscribed client can receive the next host dispatch before the
-    // corresponding user message is loaded. That dispatch is also a turn
-    // boundary: never append its wrap-up to an older completed summary.
-    if (!message.teamWrapup) break;
     return i;
   }
   return -1;
@@ -1652,6 +1827,7 @@ function appendStreamingToken(
   speakerAgentId?: string,
   snapshot = false,
   wrapup = false,
+  keepLive = false,
 ): void {
   if (!content) return;
   const speaker = speakerAgentId?.trim() || undefined;
@@ -1675,7 +1851,7 @@ function appendStreamingToken(
         id: state.streamId,
         role: "assistant",
         content,
-        status: snapshot ? "done" : "streaming",
+        status: snapshot && !keepLive ? "done" : "streaming",
         timestamp: Date.now(),
         speakerAgentId: speaker,
         teamWrapup: true,
@@ -1704,7 +1880,7 @@ function appendStreamingToken(
           id: generateId(),
           role: "assistant",
           content,
-          status: "done",
+          status: keepLive ? "streaming" : "done",
           timestamp: Date.now(),
           speakerAgentId: speaker,
         },
@@ -1716,10 +1892,11 @@ function appendStreamingToken(
         ? content
         : prev
       : content;
-    if (next !== prev || target.status !== "done") {
+    const snapStatus = keepLive ? "streaming" : "done";
+    if (next !== prev || target.status !== snapStatus) {
       state.messages = [
         ...state.messages.slice(0, idx),
-        { ...target, content: next, status: "done" },
+        { ...target, content: next, status: snapStatus },
         ...state.messages.slice(idx + 1),
       ];
     }
@@ -1733,7 +1910,7 @@ function appendStreamingToken(
         id: generateId(),
         role: "assistant",
         content,
-        status: "done",
+        status: keepLive ? "streaming" : "done",
         timestamp: Date.now(),
         speakerAgentId: speaker,
       },
@@ -2265,6 +2442,33 @@ function finalizeHostTurn(state: SessionStreamState, sessionId?: string): void {
   if (hostId) finalizeStreamingMessages(state, undefined, hostId);
 }
 
+function stampTurnDuration(
+  state: SessionStreamState,
+  durationMs: number,
+  speaker: string | undefined,
+  sessionId?: string,
+): void {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  const hostId = sessionHostAgentId(state, sessionId);
+  const rounded = Math.round(durationMs);
+  for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+    const message = state.messages[index];
+    if (message.role !== "assistant" || message.toolData) continue;
+    if (
+      !speakerMatchesFinalize(
+        message.speakerAgentId,
+        speaker,
+        hostId,
+        Boolean(state.isTeamRoom),
+      )
+    ) {
+      continue;
+    }
+    state.messages[index] = { ...message, durationMs: rounded };
+    return;
+  }
+}
+
 /** Mark still-streaming assistant bubbles as done for one speaker (or host). */
 function finalizeStreamingMessages(
   state: SessionStreamState,
@@ -2513,141 +2717,6 @@ function appendErrorBubble(
  * @param resumeAttempt Internal counter for auto-reconnect after drop (do not
  *   pass from call sites except recursive re-attach).
  */
-const reportedUnknownLocalTasks = new Set<string>();
-const localRuntimeAttachments = new Map<string, () => void>();
-
-function applyLocalProcessOutput(
-  state: SessionStreamState,
-  event: RuntimeEvent,
-): void {
-  if (event.event !== "process_output" || !event.tool_call_id || !event.content)
-    return;
-  state.messages = state.messages.map((item) => {
-    if (
-      !item.toolData ||
-      item.toolData.callId !== event.tool_call_id ||
-      item.status !== "streaming"
-    )
-      return item;
-    const content =
-      event.stream === "stderr" ? `[stderr] ${event.content}` : event.content;
-    return {
-      ...item,
-      toolData: {
-        ...item.toolData,
-        output: `${item.toolData.output ?? ""}${content}`.slice(-32768),
-      },
-    };
-  });
-}
-
-async function attachLocalRuntime(
-  sessionId: string,
-  threadId: string,
-  onStreamEnd?: () => void,
-): Promise<void> {
-  if (localStreams.has(sessionId)) return;
-  const bridge = window.__octopRuntime;
-  if (!bridge) return;
-  const state = getOrCreate(sessionId);
-  const controller = new AbortController();
-  let closed = false;
-  let observing = false;
-  const finish = (announce = true) => {
-    if (closed) return;
-    closed = true;
-    unsubscribe();
-    controller.signal.removeEventListener("abort", cancel);
-    localStreams.delete(sessionId);
-    localRuntimeAttachments.delete(sessionId);
-    if (state.abortController === controller) state.abortController = null;
-    if (observing) {
-      clearStreamingFlags(state);
-      clearStreamActivity(sessionId);
-      sealInFlightAssistantMessages(state);
-      notify(state);
-      if (announce) {
-        emitStreamEvent({ kind: "streamEnd", sessionId });
-        onStreamEnd?.();
-      }
-    }
-  };
-  const markActive = () => {
-    const changed = !observing || !state.isStreaming;
-    observing = true;
-    localStreams.add(sessionId);
-    state.abortController = controller;
-    state.isStreaming = true;
-    touchStreamActivity(sessionId);
-    if (changed) notify(state);
-  };
-  const cancel = () => {
-    void bridge.cancel({ thread_id: threadId }).catch(() => {});
-  };
-  const unsubscribe = bridge.subscribe((event) => {
-    if (event.event === "runtime_exit") {
-      if (observing)
-        appendErrorBubble(
-          state,
-          event.error || "本地运行时已退出，请核对任务结果。",
-          "local_runtime_error",
-        );
-      finish();
-      return;
-    }
-    if (event.thread_id !== threadId) return;
-    if (event.event === "process_output") {
-      applyLocalProcessOutput(state, event);
-      notifyStream(state);
-      markActive();
-    }
-    if (event.event === "chunk" && event.data) {
-      handleHarnessChunk(state, event.data, sessionId);
-      markActive();
-    }
-    if (event.event === "done") {
-      if (event.error)
-        appendErrorBubble(state, event.error, "local_runtime_error");
-      finish();
-    }
-  });
-  controller.signal.addEventListener("abort", cancel, { once: true });
-  // Reserve observation before the asynchronous cold-start status request.
-  // A send takes over this subscription, so each chunk reaches the store once.
-  localStreams.add(sessionId);
-  localRuntimeAttachments.set(sessionId, () => finish(false));
-  try {
-    // Status follows subscription, so a task completing during this request is
-    // observed. This never invokes start or replays an earlier tool invocation.
-    const status = await bridge.status();
-    if (closed) return;
-    const task = status.active_tasks.find(
-      (item) => item.thread_id === threadId,
-    );
-    if (task && ["running", "cancel_requested"].includes(task.status ?? "")) {
-      markActive();
-      return;
-    }
-    if (
-      task?.status === "unknown" &&
-      !reportedUnknownLocalTasks.has(task.task_id)
-    ) {
-      reportedUnknownLocalTasks.add(task.task_id);
-      appendErrorBubble(
-        state,
-        "上次本地任务中断，结果待核对。请检查已有成果后到设置中结束中断任务；系统不会自动重新执行。",
-        "local_runtime_unknown",
-      );
-      notify(state);
-    }
-  } catch {
-    // Once live events prove a task is running, keep observing even if the
-    // separate diagnostic request fails. Historical reads remain independent.
-    if (observing) return;
-  }
-  finish();
-}
-
 export async function attachThread(
   sessionId: string,
   agentId: string,
@@ -2657,12 +2726,6 @@ export async function attachThread(
   opts?: { afterUnexpectedDrop?: boolean },
 ): Promise<void> {
   if (!agentId || !threadId || threadId === "__empty__") return;
-  // Local tasks own their native stream. Opening history must never subscribe
-  // to the server execution loop or replay a task after a WebView restart.
-  if (isCompanyDesktop()) {
-    await attachLocalRuntime(sessionId, threadId, onStreamEnd);
-    return;
-  }
 
   const existing = liveSockets.get(sessionId);
   if (existing && !existing.listenOnly && isLiveSocketOpen(sessionId)) {
@@ -2757,6 +2820,7 @@ export async function attachThread(
     controller.signal.addEventListener("abort", onAbort, { once: true });
 
     ws.onopen = () => {
+      if (liveSockets.get(sessionId)?.ws !== ws) return;
       touchStreamActivity(sessionId);
       startSocketPing(live);
       try {
@@ -2768,10 +2832,20 @@ export async function attachThread(
     };
 
     ws.onmessage = (event) => {
+      if (liveSockets.get(sessionId)?.ws !== ws) return;
       try {
         const data = JSON.parse(String(event.data)) as Record<string, unknown>;
         if (!data || typeof data !== "object") return;
         if (!frameBelongsToThread(data, live.threadId)) return;
+        const frameTurnId = (data as { turn_id?: unknown }).turn_id;
+        if (
+          (data as { type?: unknown }).type === "turn.ended" &&
+          typeof frameTurnId === "string" &&
+          state.activeTurnId &&
+          frameTurnId !== state.activeTurnId
+        )
+          return;
+        if (applyThreadTitleFrame(data)) return;
 
         if (data.type === "turn_status") {
           if (turnStatusAction(Boolean(data.active)) === "expect_stream") {
@@ -2821,7 +2895,7 @@ export async function attachThread(
           ) {
             if (hitlKeepsSocket(data)) {
               parkLiveSocketForHitl(data, state, sessionId, live);
-            } else if (state.isTeamRoom) {
+            } else if (keepRoomSocket(state, agentId)) {
               live.listenOnly = true;
               finish("host");
             } else {
@@ -2842,7 +2916,7 @@ export async function attachThread(
         ) {
           if (hitlKeepsSocket(data)) {
             parkLiveSocketForHitl(data, state, sessionId, live);
-          } else if (state.isTeamRoom) {
+          } else if (keepRoomSocket(state, agentId)) {
             live.listenOnly = true;
             finish("host");
           } else {
@@ -2860,6 +2934,10 @@ export async function attachThread(
     };
 
     ws.onclose = () => {
+      if (liveSockets.has(sessionId) && liveSockets.get(sessionId)?.ws !== ws) {
+        settleOpen();
+        return;
+      }
       controller.signal.removeEventListener("abort", onAbort);
       const wasIntentional = live.intentionalClose;
       const userCancelled = live.userCancelled;
@@ -2903,6 +2981,7 @@ export async function attachThread(
         })
       ) {
         setTimeout(() => {
+          if (sessionStates.get(sessionId) !== state) return;
           void attachThread(
             sessionId,
             agentId,
@@ -2956,7 +3035,7 @@ async function sendTurnWebSocket(
   reasoningEffort?: string | null,
   conversationMode?: "ask" | "plan" | "craft" | null,
   hitlPolicy?: { mode: string; tools?: string[] } | null,
-  device?: DeviceSelection | null,
+  clientMessageId?: string | null,
 ): Promise<boolean> {
   const state = getOrCreate(sessionId);
   const resolvedThreadId = (threadId || sessionId).trim();
@@ -3006,6 +3085,7 @@ async function sendTurnWebSocket(
     controller.signal.addEventListener("abort", onAbort, { once: true });
 
     ws.onopen = () => {
+      if (liveSockets.get(sessionId)?.ws !== ws) return;
       openedForTurn = true;
       startSocketPing(live);
       const payload: Record<string, unknown> = {
@@ -3016,6 +3096,7 @@ async function sendTurnWebSocket(
           {
             role: "user",
             content: messageContent,
+            ...(clientMessageId ? { id: clientMessageId } : {}),
           },
         ],
       };
@@ -3038,15 +3119,26 @@ async function sendTurnWebSocket(
       if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
       if (conversationMode) payload.conversation_mode = conversationMode;
       if (hitlPolicy) payload.hitl_policy = hitlPolicy;
-      if (device) payload.device = device;
       ws.send(JSON.stringify(payload));
     };
 
     ws.onmessage = (event) => {
+      if (liveSockets.get(sessionId)?.ws !== ws) return;
       try {
         const data = JSON.parse(String(event.data)) as HarnessChunk;
         if (!data || typeof data !== "object") return;
         if (!frameBelongsToThread(data, live.threadId)) return;
+        const frameTurnId = (data as { turn_id?: unknown }).turn_id;
+        if (
+          (data as { type?: unknown }).type === "turn.ended" &&
+          typeof frameTurnId === "string" &&
+          state.activeTurnId &&
+          frameTurnId !== state.activeTurnId
+        )
+          return;
+        if (applyThreadTitleFrame(data as unknown as Record<string, unknown>)) {
+          return;
+        }
         if ((data as { type?: string }).type === "turn_status") return;
         if (
           applySteerProtocolFrame(
@@ -3067,7 +3159,7 @@ async function sendTurnWebSocket(
               parkLiveSocketForHitl(data, state, sessionId, live);
             } else {
               controller.signal.removeEventListener("abort", onAbort);
-              if (state.isTeamRoom) {
+              if (keepRoomSocket(state, agentId)) {
                 live.listenOnly = true;
                 finish("host");
               } else {
@@ -3091,7 +3183,7 @@ async function sendTurnWebSocket(
             parkLiveSocketForHitl(data, state, sessionId, live);
           } else {
             controller.signal.removeEventListener("abort", onAbort);
-            if (state.isTeamRoom) {
+            if (keepRoomSocket(state, agentId)) {
               live.listenOnly = true;
               finish("host");
             } else {
@@ -3111,6 +3203,10 @@ async function sendTurnWebSocket(
     };
 
     ws.onclose = () => {
+      if (liveSockets.has(sessionId) && liveSockets.get(sessionId)?.ws !== ws) {
+        settle(true);
+        return;
+      }
       const wasIntentional = live.intentionalClose;
       const userCancelled = live.userCancelled;
       // Capture before any finish() clears streaming flags.
@@ -3140,6 +3236,7 @@ async function sendTurnWebSocket(
         touchStreamActivity(sessionId);
         if (!settled) settle(true);
         setTimeout(() => {
+          if (sessionStates.get(sessionId) !== state) return;
           void attachThread(
             sessionId,
             agentId,
@@ -3186,8 +3283,9 @@ async function sendTurnWebSocket(
       // can still stream into this room. 1:1 chats close after the host done.
       if (
         settled &&
+        !wasIntentional &&
         !userCancelled &&
-        state.isTeamRoom &&
+        keepRoomSocket(state, agentId) &&
         resolvedThreadId &&
         resolvedThreadId !== "__empty__" &&
         !isLiveSocketOpen(sessionId)
@@ -3214,11 +3312,9 @@ export async function sendTurn(
   reasoningEffort?: string | null,
   conversationMode?: "ask" | "plan" | "craft" | null,
   hitlPolicy?: { mode: string; tools?: string[] } | null,
-  device?: DeviceSelection | null,
-  editMessageId?: string,
+  clientMessageId?: string | null,
 ): Promise<void> {
   const state = getOrCreate(sessionId);
-  localRuntimeAttachments.get(sessionId)?.();
   rememberRoomAgent(state, agentId);
 
   if (sessionId === "__pending__" || threadId === "__pending__") {
@@ -3254,8 +3350,24 @@ export async function sendTurn(
   state.streamMsg = "";
   state.streamId = "";
   state.streamBlockType = "";
+  const trimmed = text.trim();
+  const userTurns = state.messages.filter(
+    (message) => message.role === "user",
+  ).length;
+  if (userTurns === 1 && trimmed && !trimmed.startsWith("/")) {
+    const title = clipThreadTitle(trimmed);
+    if (title) {
+      emitSessionEvent({
+        kind: "sessionRenamed",
+        sessionId,
+        agentId,
+        title,
+        provisional: true,
+      });
+      settleGeneratedTitle(agentId, sessionId);
+    }
+  }
   beginStream(state, sessionId);
-  state.localPreparing = isCompanyDesktop();
   state.runUsage = null;
   usageSamplesByState.delete(state);
   notify(state);
@@ -3271,7 +3383,6 @@ export async function sendTurn(
   const finish = (mode: "all" | "host" = "all") => {
     if (finished) return;
     finished = true;
-    if (state.abortController !== controller) return;
     clearStreamingFlags(state);
     clearStreamActivity(sessionId);
     pendingResumeBySession.delete(sessionId);
@@ -3288,203 +3399,6 @@ export async function sendTurn(
     emitStreamEvent({ kind: "streamEnd", sessionId });
     onStreamEnd?.();
   };
-
-  if (isCompanyDesktop()) {
-    const localThreadId = (threadId || sessionId).trim();
-    localStreams.add(sessionId);
-    const beforeEdit = editMessageId ? state.messages : undefined;
-    const editToken = editingLocalSessions.get(sessionId);
-    let started = false;
-    const markStarted = () => {
-      started = true;
-      if (editMessageId && editingLocalSessions.get(sessionId) === editToken) {
-        editingLocalSessions.delete(sessionId);
-      }
-      state.localPreparing = false;
-    };
-    try {
-      if (
-        attachments?.some(
-          (attachment) =>
-            !attachment.localFile && !attachment.workspacePath?.trim(),
-        )
-      ) {
-        throw new Error(
-          "本地任务附件需要先上传到当前专家的工作目录，请重新选择文件。",
-        );
-      }
-      if (targetAgentIds?.length || state.isTeamRoom) {
-        throw new Error("当前本地运行时暂不支持多专家协作，请新建单专家会话。");
-      }
-      const localAttachments: ChatAttachment[] = [];
-      for (const attachment of attachments ?? []) {
-        if (attachment.localFile) {
-          localAttachments.push(attachment);
-          continue;
-        }
-        const runtime = requireDesktopRuntime();
-        if (!runtime.importAttachment)
-          throw new Error(
-            "当前客户端尚不支持导入上传的附件，请安装更新后的客户端。",
-          );
-        localAttachmentImports.set(sessionId, controller);
-        const file = await runtime.importAttachment({
-          agent_id: agentId,
-          workspace_path: attachment.workspacePath!,
-          filename: attachment.filename,
-          thread_id: localThreadId,
-          token: getAuthToken(),
-        });
-        if (state.abortController !== controller || controller.signal.aborted)
-          return;
-        localAttachments.push({
-          ...attachment,
-          url: "",
-          workspacePath: file.path,
-          localFile: file,
-        });
-      }
-      if (localAttachmentImports.get(sessionId) === controller)
-        localAttachmentImports.delete(sessionId);
-      if (state.abortController !== controller || controller.signal.aborted)
-        return;
-      const localText = [
-        text,
-        ...localAttachments
-          .map((attachment) => `[file: ${attachment.localFile!.path}]`)
-          .filter((hint) => !text.includes(hint)),
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-      const localTaskId = createRuntimeTaskId();
-      if (editMessageId) {
-        const index = state.messages.findIndex(
-          (m) => m.id === editMessageId && m.role === "user",
-        );
-        if (index < 0) throw new Error("消息已变化，请刷新会话后重试编辑。");
-        historyRevisions.set(state, getHistoryRevision(sessionId) + 1);
-        state.messages = [
-          ...state.messages.slice(0, index),
-          {
-            ...state.messages[index],
-            content: localText,
-            ...(localAttachments.length
-              ? { attachments: localAttachments }
-              : {}),
-            timestamp: Date.now(),
-            status: "done",
-          },
-        ];
-      }
-      // Keep the optimistic user message and persisted HumanMessage identical.
-      const userIndex = state.messages.length - 1;
-      if (state.messages[userIndex]?.role === "user") {
-        state.messages = state.messages.map((message, index) =>
-          index === userIndex
-            ? {
-                ...message,
-                id: `${localTaskId}_user`,
-                content: localText,
-                ...(localAttachments.length
-                  ? { attachments: localAttachments }
-                  : {}),
-              }
-            : message,
-        );
-      }
-      notify(state);
-      await runLocalTurn(
-        {
-          task_id: localTaskId,
-          thread_id: localThreadId,
-          agent_id: agentId,
-          text: localText,
-          ...(localAttachments.length
-            ? {
-                local_attachments: localAttachments.map(
-                  (attachment) => attachment.localFile!,
-                ),
-              }
-            : {}),
-          ...(editMessageId ? { edit_message_id: editMessageId } : {}),
-          ...(modelRef ? { model: modelRef } : {}),
-          ...(knowledgeBaseIds ? { knowledge_base_ids: knowledgeBaseIds } : {}),
-          ...(reasoningMode ? { reasoning_mode: reasoningMode } : {}),
-          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-          ...(conversationMode ? { conversation_mode: conversationMode } : {}),
-        },
-        (event) => {
-          if (state.abortController !== controller) return;
-          markStarted();
-          touchStreamActivity(sessionId);
-          if (event.event === "process_output") {
-            applyLocalProcessOutput(state, event);
-            notifyStream(state);
-          }
-          if (event.event === "steer" && event.frame) {
-            applySteerProtocolFrame(state, event.frame, sessionId);
-            notify(state);
-          }
-          if (event.event === "chunk" && event.data) {
-            handleHarnessChunk(state, event.data, sessionId);
-            // The harness may finish before company history/artifacts are
-            // acknowledged. Only the native lifecycle event unlocks the turn.
-            if (!state.isStreaming) {
-              state.isStreaming = true;
-              notifyStream(state);
-            }
-          }
-          if (event.event === "done" && event.artifacts?.length) {
-            const previous = localArtifactHistory.get(state) ?? [];
-            const files = changedLocalArtifacts(
-              state.messages,
-              event.artifacts,
-              previous,
-            );
-            const known = new Map(previous.map((file) => [file.path, file]));
-            for (const file of event.artifacts) known.set(file.path, file);
-            localArtifactHistory.set(state, [...known.values()]);
-            state.messages = placeLocalArtifactTurns(state.messages, [
-              {
-                task_id: localTaskId,
-                user_message_id: `${localTaskId}_user`,
-                // Older native clients still emit cumulative project snapshots.
-                // The server reconstructs the same delta when history is loaded.
-                message_id: state.messages.at(-1)?.id,
-                files,
-              },
-            ]);
-            notify(state);
-          }
-        },
-        controller.signal,
-        () => {
-          if (state.abortController === controller) {
-            markStarted();
-            notify(state);
-          }
-        },
-      );
-    } catch (error) {
-      if (state.abortController !== controller || controller.signal.aborted)
-        return;
-      if (beforeEdit && !started) state.messages = beforeEdit;
-      appendErrorBubble(
-        state,
-        error instanceof Error ? error.message : "本地任务失败，请检查运行时。",
-        "local_runtime_error",
-      );
-    } finally {
-      if (localAttachmentImports.get(sessionId) === controller)
-        localAttachmentImports.delete(sessionId);
-      if (state.abortController === controller) {
-        localStreams.delete(sessionId);
-        applySteerProtocolFrame(state, { type: "turn.ended" }, sessionId);
-      }
-      finish();
-    }
-    return;
-  }
 
   const wsOk = await sendTurnWebSocket(
     sessionId,
@@ -3504,7 +3418,7 @@ export async function sendTurn(
     reasoningEffort,
     conversationMode,
     hitlPolicy,
-    device,
+    clientMessageId,
   );
   if (!wsOk) {
     state.messages = [
@@ -3580,15 +3494,6 @@ export async function resumeHitl(
   pendingId?: string,
 ): Promise<void> {
   const state = getOrCreate(sessionId);
-  if (isCompanyDesktop()) {
-    appendErrorBubble(
-      state,
-      "企业客户端中的旧服务器会话仅供查看，无法继续服务器审批；请新建本地会话。",
-      "legacy_thread_read_only",
-    );
-    notify(state);
-    return;
-  }
   const live = liveSockets.get(sessionId);
   // The pause parks the dashboard socket as listen-only. Aborting it sends
   // cancel and streamEnd, which flushes messages the user queued during the
@@ -3706,14 +3611,9 @@ function steerClientIds(
   return state.pendingSteers.map((s) => s.clientPendingId);
 }
 
-function optimisticAttachments(
-  state: SessionStreamState,
-  ids: string[],
-): ChatAttachment[] {
+function optimisticAttachments(state: SessionStreamState): ChatAttachment[] {
   return state.messages.flatMap((message) =>
-    ids.some((id) => message.id === optimisticSteerMessageId(id))
-      ? message.attachments ?? []
-      : [],
+    message.id.startsWith("steer:") ? message.attachments ?? [] : [],
   );
 }
 
@@ -4037,11 +3937,8 @@ function applySteerProtocolFrame(
     // Drain swaps optimistic rows for the canonical server bubble (the
     // user/meta.steer frame lands first and already did the swap; this is
     // the safety net for reordered frames).
-    const ids = steerClientIds(data, state);
-    dropOptimisticSteerMessages(state, ids);
-    state.pendingSteers = state.pendingSteers.filter(
-      (item) => !ids.includes(item.clientPendingId),
-    );
+    dropOptimisticSteerMessages(state, steerClientIds(data, state));
+    state.pendingSteers = [];
     return true;
   }
   if (type === "steer.removed") {
@@ -4087,24 +3984,14 @@ function applySteerProtocolFrame(
     // drain is all-at-once, so settle every optimistic row here first —
     // the canonical coalesced bubble replaces them. Capture local preview
     // URLs before the rows go away.
-    // A newer local insert may be waiting for its acknowledgement while this
-    // earlier batch arrives. Settle only the IDs included in that batch.
-    const ids = Array.isArray(data.client_pending_ids)
-      ? steerClientIds(data, state)
-      : [
-          ...state.pendingSteers.map((s) => s.clientPendingId),
-          ...state.messages
-            .filter((m) => m.id.startsWith("steer:"))
-            .map((m) => m.id.slice("steer:".length)),
-        ];
-    const keptAttachments = optimisticAttachments(state, ids);
-    const optimisticIndex = state.messages.findIndex((message) =>
-      ids.some((id) => message.id === optimisticSteerMessageId(id)),
-    );
-    dropOptimisticSteerMessages(state, ids);
-    state.pendingSteers = state.pendingSteers.filter(
-      (item) => !ids.includes(item.clientPendingId),
-    );
+    const keptAttachments = optimisticAttachments(state);
+    dropOptimisticSteerMessages(state, [
+      ...state.pendingSteers.map((s) => s.clientPendingId),
+      ...state.messages
+        .filter((m) => m.id.startsWith("steer:"))
+        .map((m) => m.id.slice("steer:".length)),
+    ]);
+    state.pendingSteers = [];
     const content = String(data.content || "");
     const messageId = String(data.message_id || generateId());
     const frameAttachments = attachmentsFromSteerFrame(data.attachments);
@@ -4114,10 +4001,8 @@ function applySteerProtocolFrame(
       (content || (attachments && attachments.length > 0)) &&
       !state.messages.some((m) => m.id === messageId)
     ) {
-      const index =
-        optimisticIndex < 0 ? state.messages.length : optimisticIndex;
       state.messages = [
-        ...state.messages.slice(0, index),
+        ...state.messages,
         {
           id: messageId,
           role: "user",
@@ -4126,7 +4011,6 @@ function applySteerProtocolFrame(
           status: "done",
           timestamp: Date.now(),
         },
-        ...state.messages.slice(index),
       ];
     }
     return true;
@@ -4150,57 +4034,38 @@ export function sendSteerWhileBusy(
     clientPendingId?: string;
     attachments?: ChatAttachment[];
   },
-): "ok" | "empty" | "no_socket" | "not_ready" | "unsupported" | "attachments" {
+): "ok" | "empty" | "no_socket" {
   const trimmed = text.trim();
   const attachments =
     opts.attachments && opts.attachments.length > 0
       ? opts.attachments
       : undefined;
   if (!trimmed && !attachments) return "empty";
-  const state = getOrCreate(sessionId);
-  const company = isCompanyDesktop();
-  const runtime = company ? window.__octopRuntime : undefined;
   const live = liveSockets.get(sessionId);
-  if (company) {
-    if (!state.isStreaming) return "no_socket";
-    if (!runtime?.steer) return "unsupported";
-    if (attachments) return "attachments";
-    if (!state.activeTurnId) return "not_ready";
-  } else if (!live || live.ws.readyState !== WebSocket.OPEN) {
-    return "no_socket";
-  }
+  if (!live || live.ws.readyState !== WebSocket.OPEN) return "no_socket";
   const cpid = (opts.clientPendingId || generateId()).trim();
-  const turnId = (opts.expectedTurnId || state.activeTurnId || "").trim();
+  const turnId = (opts.expectedTurnId || "").trim();
   const messageContent = buildUserMessageContent(trimmed, attachments);
-  let nativeRequest: Promise<Record<string, unknown>> | undefined;
   try {
-    if (company && runtime?.steer) {
-      nativeRequest = runtime.steer({
-        thread_id: sessionId,
+    live.ws.send(
+      JSON.stringify({
+        type: "user_turn",
         text: trimmed,
-        expected_turn_id: turnId,
+        thread_id: live.threadId,
+        delivery: "auto",
+        ...(turnId ? { expected_turn_id: turnId } : {}),
         client_pending_id: cpid,
-      });
-    } else if (live) {
-      live.ws.send(
-        JSON.stringify({
-          type: "user_turn",
-          text: trimmed,
-          thread_id: live.threadId,
-          delivery: "auto",
-          ...(turnId ? { expected_turn_id: turnId } : {}),
-          client_pending_id: cpid,
-          messages: [{ role: "user", content: messageContent }],
-        }),
-      );
-    }
+        messages: [{ role: "user", content: messageContent }],
+      }),
+    );
   } catch {
-    return company ? "not_ready" : "no_socket";
+    return "no_socket";
   }
   // The committed input enters the visible conversation
   // immediately (optimistic user row), settled by steer.queued / drained /
   // rejected. The caller drops the chip on success; this entry tracks the
   // optimistic row until its server fact arrives.
+  const state = getOrCreate(sessionId);
   appendOptimisticSteerMessage(state, cpid, trimmed, attachments);
   if (!state.pendingSteers.some((s) => s.clientPendingId === cpid)) {
     const previewSource = trimmed || attachments?.[0]?.filename || "";
@@ -4219,22 +4084,6 @@ export function sendSteerWhileBusy(
     ];
     notify(state);
   }
-  if (nativeRequest) {
-    const settleNative = (frame: Record<string, unknown>) => {
-      // A native drain/end event can win the race with the IPC reply.
-      if (!state.pendingSteers.some((item) => item.clientPendingId === cpid))
-        return;
-      applySteerProtocolFrame(state, frame, sessionId);
-      notify(state);
-    };
-    void nativeRequest.then(settleNative, () =>
-      settleNative({
-        type: "steer.rejected",
-        client_pending_id: cpid,
-        reason: "local_runtime_unavailable",
-      }),
-    );
-  }
   return "ok";
 }
 
@@ -4251,41 +4100,6 @@ export function withdrawCommittedSteer(
   if (!pending) return "missing";
   if (!state.activeTurnId || pending.pendingId === pending.clientPendingId) {
     return "pending_ack";
-  }
-  if (isCompanyDesktop()) {
-    const runtime = window.__octopRuntime;
-    if (!runtime?.removeSteer) return "pending_ack";
-    state.pendingSteers = state.pendingSteers.map((item) =>
-      item.clientPendingId === cpid ? { ...item, withdrawing: true } : item,
-    );
-    notify(state);
-    void runtime
-      .removeSteer({
-        thread_id: sessionId,
-        turn_id: state.activeTurnId,
-        client_pending_id: cpid,
-        pending_id: pending.pendingId,
-      })
-      .then(
-        (frame) => {
-          applySteerProtocolFrame(state, frame, sessionId);
-          notify(state);
-        },
-        () => {
-          applySteerProtocolFrame(
-            state,
-            {
-              type: "steer.ack",
-              status: "rejected",
-              client_pending_id: cpid,
-              reason: "local_runtime_unavailable",
-            },
-            sessionId,
-          );
-          notify(state);
-        },
-      );
-    return "ok";
   }
   const live = liveSockets.get(sessionId);
   if (!live || live.ws.readyState !== WebSocket.OPEN) return "pending_ack";

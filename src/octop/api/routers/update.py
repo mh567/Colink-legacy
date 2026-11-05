@@ -9,7 +9,7 @@ import sys
 import time
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Query, Request
 from pydantic import BaseModel, Field
 
 from octop.api.deps import current_user, get_server, require_permission
@@ -33,7 +33,7 @@ from octop.infra.setup.self_update import (
     is_prerelease,
     parse_changelog_for_version,
     run_upgrade,
-    self_update_disabled_reason,
+    validate_upgrade_target,
 )
 from octop.infra.setup.service import (
     ServiceRuntime,
@@ -42,6 +42,7 @@ from octop.infra.setup.service import (
     is_service_installed,
     restart_service,
 )
+from octop.infra.utils.locale import DEFAULT_LOCALE, resolve_locale, resolve_request_locale
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,8 @@ class UpdateSettingsBody(BaseModel):
 class UpgradeBody(BaseModel):
     version: str | None = Field(
         default=None,
-        description="Pin this release. Defaults to the channel latest (stable when stable_only).",
+        description="Pin a newer release. Same/older versions are rejected before installation. "
+        "Defaults to the channel latest (stable when stable_only).",
     )
 
 
@@ -97,12 +99,6 @@ def _present_status(
     stable_only: bool,
     include_prerelease: bool,
 ) -> dict[str, Any]:
-    if reason := self_update_disabled_reason():
-        cached = {
-            "current_version": get_local_version(),
-            "error": reason,
-            "error_code": "manual_update_required",
-        }
     current = str(cached.get("current_version") or get_local_version())
     latest_any = cached.get("latest_any") or cached.get("latest_version")
     latest_stable = cached.get("latest_stable")
@@ -150,10 +146,6 @@ def _build_status(
     include_prerelease: bool = False,
 ) -> dict[str, Any]:
     current = get_local_version()
-    if reason := self_update_disabled_reason():
-        error = reason
-        error_code = "manual_update_required"
-        latest = latest_any = latest_stable = source = description = None
     if latest_any is None:
         latest_any = latest
     if latest_any is None and error is None:
@@ -204,7 +196,7 @@ async def update_status(
     stable_only = _read_stable_only(server)
     cached = get_cached_status()
     if cached is not None:
-        return _auto_status(cached, stable_only=stable_only)
+        return await asyncio.to_thread(_auto_status, cached, stable_only=stable_only)
     return await asyncio.to_thread(
         _build_status,
         stable_only=stable_only,
@@ -218,8 +210,6 @@ async def check_for_updates(
     server: Any = Depends(get_server),
 ) -> dict[str, Any]:
     stable_only = _read_stable_only(server)
-    if self_update_disabled_reason() is not None:
-        return _build_status(stable_only=stable_only, include_prerelease=True)
     pypi_info = await asyncio.to_thread(fetch_pypi_info)
     if pypi_info is None:
         return await asyncio.to_thread(
@@ -256,8 +246,11 @@ async def update_settings(
             stable_only=body.stable_only,
             include_prerelease=not body.stable_only,
         )
-    remapped = _present_status(
-        cached, stable_only=body.stable_only, include_prerelease=not body.stable_only
+    remapped = await asyncio.to_thread(
+        _present_status,
+        cached,
+        stable_only=body.stable_only,
+        include_prerelease=not body.stable_only,
     )
     cache_status(remapped)
     return _public_status(remapped)
@@ -268,6 +261,7 @@ async def _upgrade_worker(
     *,
     allow_prerelease: bool = False,
     version: str | None = None,
+    locale: str = DEFAULT_LOCALE,
 ) -> None:
     await update_task(task_id, stage="downloading", percent=20)
     upgrade_task = asyncio.create_task(
@@ -276,6 +270,7 @@ async def _upgrade_worker(
             verbose=False,
             allow_prerelease=allow_prerelease,
             version=version,
+            locale=locale,
         )
     )
     percent = 20
@@ -326,14 +321,13 @@ async def _upgrade_worker(
     )
 
 
-@router.post("/upgrade")
+@router.post("/upgrade", summary="Upgrade Octop")
 async def trigger_upgrade(
+    request: Request,
     body: UpgradeBody = Body(default_factory=UpgradeBody),
     server: Any = Depends(get_server),
     _: Any = Depends(require_permission("update")),
 ) -> dict[str, Any]:
-    if reason := self_update_disabled_reason():
-        raise OctopError(ErrorCode.FORBIDDEN, reason)
     if get_editable_path() is not None:
         raise OctopError(
             ErrorCode.FORBIDDEN,
@@ -348,10 +342,19 @@ async def trigger_upgrade(
         latest_stable=info.latest_stable if info else None,
         stable_only=stable_only,
     )
+    validate_upgrade_target(target, await asyncio.to_thread(get_local_version))
     allow_prerelease = bool(target and is_prerelease(target))
     task = await create_task()
     asyncio.create_task(
-        _upgrade_worker(task.task_id, allow_prerelease=allow_prerelease, version=target)
+        _upgrade_worker(
+            task.task_id,
+            allow_prerelease=allow_prerelease,
+            version=target,
+            locale=resolve_locale(
+                user_locale=getattr(_, "locale", None),
+                explicit=resolve_request_locale(request),
+            ),
+        )
     )
     return {"task_id": task.task_id, "status": "started"}
 

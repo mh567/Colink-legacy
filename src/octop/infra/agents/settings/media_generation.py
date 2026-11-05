@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -12,7 +11,6 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from octop.infra.agents.providers.media_openai import register_openai_media_provider
 from octop.infra.connectors.crypto import decrypt_credentials, encrypt_credentials
 from octop.infra.db.repos.secrets import SecretRepo
 from octop.infra.db.repos.settings import SettingsRepo
@@ -21,7 +19,7 @@ from octop.infra.errors import ErrorCode, OctopError
 if TYPE_CHECKING:
     from octop_harness import MediaGenerationConfig
 
-MediaProviderName = Literal["volcengine", "dashscope", "minimax", "openai"]
+MediaProviderName = Literal["volcengine", "dashscope", "minimax"]
 MediaTestKind = Literal["image", "video"]
 
 DEFAULT_PROVIDER_ID = "volcengine-default"
@@ -60,17 +58,10 @@ class MediaProviderPreset:
 
     @property
     def default_video_model(self) -> str:
-        return self.video_models[0] if self.video_models else ""
+        return self.video_models[0]
 
 
 MEDIA_PROVIDER_PRESETS: dict[MediaProviderName, MediaProviderPreset] = {
-    "openai": MediaProviderPreset(
-        provider="openai",
-        display_name="OpenAI Compatible",
-        base_url="https://api.openai.com/v1",
-        image_models=("gpt-image-2",),
-        video_models=(),
-    ),
     "volcengine": MediaProviderPreset(
         provider="volcengine",
         display_name="Volcengine Ark",
@@ -220,35 +211,8 @@ def _validate_provider(item: MediaProviderUpdate) -> None:
     if not item.display_name:
         raise _bad_args(f"display_name is required for provider {item.id}")
     parsed = urlsplit(item.base_url)
-    # Exact administrator-supplied origins; no wildcard, credentials or redirects.
-    allowed_http = False
-    for raw in os.environ.get("OCTOP_MEDIA_HTTP_ORIGINS", "").split(","):
-        origin = urlsplit(raw.strip())
-        try:
-            if (
-                origin.scheme == parsed.scheme == "http"
-                and origin.hostname
-                and origin.hostname == parsed.hostname
-                and (origin.port or 80) == (parsed.port or 80)
-                and origin.path in {"", "/"}
-                and not origin.query
-                and not origin.fragment
-                and origin.username is None
-                and origin.password is None
-            ):
-                allowed_http = True
-        except ValueError:
-            continue
-    if (
-        (parsed.scheme != "https" and not allowed_http)
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-    ):
-        raise _bad_args(
-            f"provider {item.id} base_url must use HTTPS or an administrator-approved HTTP origin"
-        )
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise _bad_args(f"provider {item.id} base_url must be an HTTPS URL")
     if item.enabled and not (item.image_enabled or item.video_enabled):
         raise _bad_args(f"provider {item.id} must enable image or video generation")
     if item.enabled and item.image_enabled and not item.image_model:
@@ -331,17 +295,15 @@ async def verify_media_model(
         create_media_provider,
     )
 
-    register_openai_media_provider()
     config = MediaProviderConfig(
         id=item.id,
-        provider=item.provider,  # type: ignore[arg-type]  # registered OpenAI adapter extends harness 1.0.2
+        provider=item.provider,
         api_key=api_key,
         base_url=item.base_url,
         image_model=item.image_model,
         video_model=item.video_model,
         image_enabled=item.image_enabled,
         video_enabled=item.video_enabled,
-        request_timeout_seconds=600 if item.provider == "openai" else 120,
     )
     provider = create_media_provider(config)
     try:
@@ -605,7 +567,6 @@ class MediaGenerationSettingsStore:
 
     def harness_config(self) -> MediaGenerationConfig | None:
         """Build the runtime-only harness config, including decrypted keys."""
-        register_openai_media_provider()
         view = self.load()
         if not view.configured:
             return None
@@ -619,7 +580,7 @@ class MediaGenerationSettingsStore:
         providers = [
             MediaProviderConfig(
                 id=item.id,
-                provider=item.provider,  # type: ignore[arg-type]  # registered OpenAI adapter extends harness 1.0.2
+                provider=item.provider,
                 api_key=credentials[item.id],
                 base_url=item.base_url,
                 image_model=item.image_model,
@@ -627,7 +588,6 @@ class MediaGenerationSettingsStore:
                 enabled=item.enabled,
                 image_enabled=item.image_enabled,
                 video_enabled=item.video_enabled,
-                request_timeout_seconds=600 if item.provider == "openai" else 120,
             )
             for item in view.providers
             if item.enabled and credentials.get(item.id)

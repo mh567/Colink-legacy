@@ -5,8 +5,6 @@
 .vscode
 *.md
 !README.md
-# Expert instructions and skills are runtime package data.
-!src/**/*.md
 
 # Python dev and cache
 __pycache__
@@ -41,6 +39,9 @@ node_modules
 .env
 .env.*
 !.env.example
+
+# Marketplace catalog is not part of the runtime image.
+marketplace
 
 # Misc
 .DS_Store

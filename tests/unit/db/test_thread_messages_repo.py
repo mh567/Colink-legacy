@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
-
-import pytest
 
 from octop.infra.db.migrate import run_migrations
 from octop.infra.db.pool import SqlitePool
@@ -109,61 +106,3 @@ def test_migration_summary_and_candidates_are_scoped(tmp_path: Path) -> None:
         ("old-2", "failed"),
         ("old-1", "pending"),
     ]
-
-
-@pytest.mark.parametrize("envelope", ["data", "kwargs", None])
-def test_recent_context_metadata_is_scoped_and_bounded(
-    tmp_path: Path, envelope: str | None
-) -> None:
-    _db, threads, messages = _repos(tmp_path)
-    for tid in ("local", "other"):
-        threads.insert(
-            thread_id=tid,
-            agent_id="agt",
-            user_id=1,
-            channel_type="dashboard",
-            session_key=tid,
-            last_active=0,
-        )
-    usage = {"input_tokens": 11046, "segments": {"system_prompt": 2436, "skills": 3058}}
-    data = {"content": "reply", "additional_kwargs": {"context_usage": usage}}
-    payload = {envelope: data} if envelope else data
-    messages.append_if_ready(
-        "local",
-        [
-            ThreadMessageInput("a1", "ai", json.dumps(payload), 1),
-            ThreadMessageInput("bad", "ai", "invalid legacy json", 2),
-            ThreadMessageInput("huge", "ai", json.dumps({"content": "x" * 300000}), 3),
-            ThreadMessageInput(
-                "user",
-                "human",
-                json.dumps(
-                    {
-                        "additional_kwargs": {
-                            "context_usage": {"input_tokens": 99999, "segments": {}}
-                        }
-                    }
-                ),
-                4,
-            ),
-        ],
-    )
-    messages.append_if_ready(
-        "other",
-        [
-            ThreadMessageInput(
-                "other-a",
-                "ai",
-                json.dumps(
-                    {
-                        "additional_kwargs": {
-                            "context_usage": {"input_tokens": 99999, "segments": {}}
-                        }
-                    }
-                ),
-                5,
-            )
-        ],
-    )
-    assert messages.last_context_usage("local") == usage
-    assert messages.last_context_usage("missing") is None

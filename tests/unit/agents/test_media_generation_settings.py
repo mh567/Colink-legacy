@@ -200,38 +200,3 @@ async def test_verify_media_credentials_uses_provider_probe(
         "url": expected_url,
         "auth": "Bearer provider-test-key",
     }
-
-
-@pytest.mark.parametrize(
-    "url,allowed",
-    [
-        ("http://images.internal:3001/v1", True),
-        ("http://images.internal:3002/v1", False),
-        ("http://images.internal.attacker:3001/v1", False),
-        ("http://user:secret@images.internal:3001/v1", False),
-        ("https://user:secret@images.internal/v1", False),
-        ("https://images.internal/v1", True),
-        ("http://192.168.5.29:3001/v1", False),
-    ],
-)
-def test_media_http_requires_explicit_origin(monkeypatch, url, allowed):
-    from octop.infra.agents.settings.media_generation import _validate_provider
-    from octop.infra.errors import OctopError
-
-    monkeypatch.setenv("OCTOP_MEDIA_HTTP_ORIGINS", "http://images.internal:3001")
-    item = MediaProviderUpdate(
-        id="image",
-        provider="openai",
-        display_name="Image",
-        base_url=url,
-        enabled=True,
-        image_enabled=True,
-        video_enabled=False,
-        image_model="test",
-        video_model="",
-    )
-    if allowed:
-        _validate_provider(item)
-    else:
-        with pytest.raises(OctopError):
-            _validate_provider(item)

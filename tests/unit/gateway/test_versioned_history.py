@@ -562,7 +562,6 @@ def test_rebind_is_rejected_before_closing_old_database(archive, monkeypatch):
     from octop.infra.errors import OctopError
 
     server = MagicMock()
-    server.communication = None
     server.user_manager.count.return_value = 0
     server.app_runtime.history_archive = archive
     open_database = MagicMock()
@@ -782,8 +781,7 @@ async def test_write_failure_does_not_deliver_or_retry_uncommitted_content(archi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stop_on_error", [False, True])
-async def test_dashboard_error_keeps_partial_tokens_and_error(archive, stop_on_error):
+async def test_dashboard_error_keeps_partial_tokens_and_error(archive):
     from unittest.mock import AsyncMock, MagicMock
 
     from octop_gateway.models import ChannelSubject, InboundMessage, TextContent
@@ -820,18 +818,7 @@ async def test_dashboard_error_keeps_partial_tokens_and_error(archive, stop_on_e
         content=[TextContent(text="question")],
         metadata={"session_key": "s", "thread_id": "t"},
     )
-    delivered = []
-    stream = processor.iter_turn_chunks(msg)
-    try:
-        async for chunk in stream:
-            delivered.append(chunk)
-            if chunk.get("type") == "error":
-                # The consumer can stop immediately, or stall while rendering.
-                assert archive.store.turn("t")["status"] == "failed"
-                if stop_on_error:
-                    break
-    finally:
-        await stream.aclose()
+    delivered = [chunk async for chunk in processor.iter_turn_chunks(msg)]
     assert any(chunk.get("type") == "error" for chunk in delivered)
     history = (await archive.page("t", limit=20, cursor=None, legacy_reader=no_anchor))["messages"]
     recovered = messages_from_dict(history)

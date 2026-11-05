@@ -29,13 +29,10 @@ COMMANDS: dict[str, tuple[str, str, str]] = {
     ),
     "version": (".commands.version", "version", "Show the installed octop version."),
     "completion": (".commands.completion", "completion", "Shell completion utilities."),
-    "update": (
-        ".commands.update",
-        "update",
-        "Disabled for Octop Enterprise; use manual source upgrades.",
-    ),
+    "update": (".commands.update", "update", "Check for and install a newer Octop release."),
     "clean": (".commands.clean", "clean", "Remove CLI state or wipe all of ~/.octop."),
     "backup": (".commands.backup", "backup", "Export and restore Octop backups."),
+    "bridge": (".commands.bridge", "bridge", "Manage remote Octop bridge peers."),
     "acp": (".commands.acp", "acp_cmd", "Run Octop agent as ACP server (stdio)."),
     "plugin": (".commands.plugin", "plugin", "Install and manage plugins."),
 }

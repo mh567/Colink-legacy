@@ -1,9 +1,6 @@
 # CLI Reference
 
-This distribution supports source deployment and local builds only; follow the
-[enterprise deployment guide](../docker/enterprise/README_EN.md). The upstream
-`pip install octop` package is not an installation method for Octop Enterprise.
-The source build registers a single Click app named `octop`.
+`octop` is a single Click app installed as `octop` on `pip install octop`.
 It is registered in `src/octop/cli/main.py`; commands are loaded
 lazily from `src/octop/cli/registry.py`.
 
@@ -26,6 +23,7 @@ Commands:
   admin      Admin commands.
   agent      Agent lifecycle commands.
   backup     Export and restore Octop backups.
+  bridge     Manage remote Octop bridge peers.
   chat       [deprecated] Alias for `octop chats`.
   chats      Chat REPL and session management.
   channel    Channel management commands.
@@ -40,7 +38,7 @@ Commands:
   run        Run octop-server in the foreground.
   service    System service lifecycle (start/stop/restart/status).
   skills     Per-agent skill enable/disable.
-  update     Disabled for Octop Enterprise; use manual source upgrades.
+  update     Check for and install a newer Octop release.
   user       User management commands.
   version    Show the installed octop version.
 ```
@@ -59,13 +57,14 @@ Commands:
 
 ## Transport layers
 
-Octop commands pick one of three transports:
+Octop commands pick one of these transports:
 
 | Layer | When | Login? | Examples |
 |-------|------|--------|----------|
-| **Offline** (local DB only) | Need to read/write `~/.octop` without a running server | No | `init`, `backup`, `plugin`, `agent list`, `chats list/get/create/update/delete`, `cron list`, `user *`, `admin overview/audit`, `models presets/list/active` |
+| **Offline** (local DB only) | Need to read/write `~/.octop` without a running server | No | `init`, `backup`, `plugin`, `agent list`, `chats list/get/create/update/delete`, `cron list`, `user *`, `admin overview/audit`, `models presets/list/active`, `bridge list/get` |
 | **Attach** (HTTP / WS) | Need a live `octop run` process (IM, streams, model pulls) | Yes (`octop user login`) | `chats send/repl`, `channel test/probe`, `models ollama-*`, `skills enable/disable`, `provider test` |
 | **Embedded** (in-process) | CLI boots `OctopServer` for a single command | No | `octop acp`, `octop chats repl`, `octop chats send` (defaults to embedded), `octop agent create/from-expert/start/stop/reload` |
+| **Embedded (bridge)** | In-process `BridgeManager` (no full server); CLI cannot keep the WS after exit | No | `bridge probe/create/patch/delete/connect/disconnect/agents` |
 
 The dashboards and HTTP callers manage their own JWTs and do **not**
 share `~/.octop/cli_state.json`.
@@ -73,7 +72,7 @@ share `~/.octop/cli_state.json`.
 ## `octop init`
 
 Bootstrap a fresh install (DB migrations, JWT secret, first admin).
-Idempotent on the DB; pass `--force` to wipe `~/.octop` first.
+Idempotent on the DB; pass `--force` to delete application state under `~/.octop` first. The install runtime (`venv/`, `bin/`) is kept.
 
 ```
 Usage: octop init [OPTIONS]
@@ -84,7 +83,7 @@ Options:
   --admin-username TEXT       [env: OCTOP_ADMIN_USERNAME]
   --admin-password TEXT       [env: OCTOP_ADMIN_PASSWORD]
   --admin-display-name TEXT   [env: OCTOP_ADMIN_DISPLAY_NAME]
-  --force                     Wipe existing ~/.octop contents before bootstrapping.
+  --force                     Delete Octop data under ~/.octop. Keeps venv/ and bin/.
   --yes                       Skip all interactive prompts.
   -h, --help                  Show this message and exit.
 ```
@@ -211,6 +210,36 @@ Commands:
 `octop chat` is a deprecated alias that prints a stderr warning and
 forwards to `chats`.
 
+## `octop bridge`
+
+User-scoped Octop-to-Octop peer links (same surface as Dashboard **远程桥接**).
+`--user` / pinned `default_user` selects the local owner. `--peer-user` is
+the **remote** login. `probe` talks HTTP only; `create --connect` /
+`connect` / `agents` verify the Bridge WebSocket then close it — start
+`octop run` to keep a link alive (auto-reconnect).
+
+```
+Usage: octop bridge [OPTIONS] COMMAND [ARGS]...
+
+  Manage remote Octop bridge peers (add / edit / probe / connect).
+
+Commands:
+  list        List saved bridge connections.
+  get         Show one saved connection.
+  probe       Test peer credentials (login + list experts).
+  create      Add a peer (optional Bridge WS handshake).
+  patch       Update name / notes / icon / credentials / auto-reconnect.
+  delete      Delete a saved connection.
+  connect     Dial and verify Bridge WS, then close the CLI session.
+  disconnect  Mark a connection disconnected in the local DB.
+  agents      Dial, list remote experts via the tunnel, then close.
+```
+
+`probe` without `CONNECTION_ID` requires `--url` and `--peer-user`.
+`probe CONNECTION_ID` reuses the stored password when `--peer-password`
+is omitted. `create` always needs the remote password: pass
+`--peer-password` or type it at the hidden prompt.
+
 ## `octop channel`
 
 Local DB channel CRUD plus platform-specific bot creators. The
@@ -253,10 +282,13 @@ Commands:
 ```
 
 `create --trigger` accepts cron expressions (`"0 9 * * *"`) and the
-`interval:N` / `date:ISO8601` aliases. `--task-type text` pushes the
-prompt verbatim; `--task-type agent` (default) runs the LLM and
-pushes the reply. `--prompt` is required, must be non-empty and ≤
-2000 characters.
+`interval:N` / `date:ISO8601` aliases. A `date:` job runs once and
+then disables itself, whether the run succeeds or fails. If the
+server is down for more than 24 hours past that time and the job
+never ran, it is marked `missed` and disabled. The row stays in the
+list. `--task-type text` pushes the prompt verbatim; `--task-type
+agent` (default) runs the LLM and pushes the reply. `--prompt` is
+required, must be non-empty and ≤ 2000 characters.
 
 ## `octop provider`
 
@@ -385,12 +417,21 @@ timezone). Automatic archives are named `octop-auto-backup-*.tar.gz`;
 retention only deletes those files and never touches manual
 `octop-backup-*.tar.gz` archives.
 
-## `octop update` (disabled)
+## `octop update`
 
-Online self-update is disabled for Octop Enterprise. Both `octop update` and
-`octop update --check` stop without checking or installing upstream packages.
-Use the [manual upgrade procedure](updates_EN.md) to build this repository’s
-source and distribute matching clients.
+Check for and install a newer Octop release from the configured
+channel (PyPI by default).
+
+```
+Usage: octop update [OPTIONS]
+
+  Check for and install a newer Octop release.
+
+Options:
+  --check / --no-check     Only check; do not install.
+  --channel TEXT           Release channel (pypi, testpypi, custom index).
+  -h, --help               Show this message and exit.
+```
 
 ## `octop plugin`
 
@@ -437,13 +478,13 @@ runner object schema.
 
 ## `octop clean`
 
-Reset CLI state or wipe the whole `~/.octop` tree. Destructive — read
-the help carefully.
+Reset CLI state, or delete Octop data under `~/.octop`. `--all` keeps the
+install runtime (`venv/`, `bin/`). Destructive — read the help carefully.
 
 ```
 Usage: octop clean [OPTIONS]
 
-  Remove CLI state or wipe all of ~/.octop.
+  Remove CLI state, or delete Octop data under ~/.octop (keeps venv/ and bin/).
 
 Options:
   --state / --all       What to remove.

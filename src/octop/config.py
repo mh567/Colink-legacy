@@ -132,11 +132,8 @@ class OctopConfig:
     cors_origins: list[str] = field(default_factory=list)
     default_timezone: str = "Asia/Shanghai"
     enable_dashboard: bool = True
-    dashboard_cdn_hosts: list[str] = field(default_factory=list)
     enable_api_docs: bool = False
     history_v2_enabled: bool = False
-    company_runtime_enabled: bool = False
-    device_channel_enabled: bool = False
     require_setup_password: bool = True
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     # False when config.json omits ``database`` (use PathLayout.db unless env overrides).
@@ -486,10 +483,6 @@ def load_config(path: Path) -> OctopConfig:
         merged["default_timezone"] = v
     if v := os.environ.get("OCTOP_CORS_ORIGINS"):
         merged["cors_origins"] = [s.strip() for s in v.split(",") if s.strip()]
-    if v := os.environ.get("OCTOP_DASHBOARD_CDN_HOSTS"):
-        merged["dashboard_cdn_hosts"] = [
-            s.strip().lower().rstrip(".") for s in v.split(",") if s.strip()
-        ]
     if v := os.environ.get("OCTOP_ENABLE_DASHBOARD"):
         merged["enable_dashboard"] = _coerce_bool(
             "OCTOP_ENABLE_DASHBOARD", v, bool(merged["enable_dashboard"])
@@ -613,7 +606,6 @@ def load_config(path: Path) -> OctopConfig:
         cors_origins=list(merged.get("cors_origins") or []),
         default_timezone=str(merged.get("default_timezone") or "Asia/Shanghai"),
         enable_dashboard=bool(merged["enable_dashboard"]),
-        dashboard_cdn_hosts=list(merged.get("dashboard_cdn_hosts") or []),
         enable_api_docs=bool(merged["enable_api_docs"]),
         history_v2_enabled=_coerce_bool(
             "OCTOP_HISTORY_V2_ENABLED",
@@ -623,20 +615,6 @@ def load_config(path: Path) -> OctopConfig:
             False,
         ),
         require_setup_password=bool(merged["require_setup_password"]),
-        company_runtime_enabled=_coerce_bool(
-            "company_runtime_enabled",
-            os.environ.get(
-                "OCTOP_COMPANY_RUNTIME_ENABLED", str(merged.get("company_runtime_enabled", False))
-            ),
-            False,
-        ),
-        device_channel_enabled=_coerce_bool(
-            "OCTOP_DEVICE_CHANNEL_ENABLED",
-            os.environ.get(
-                "OCTOP_DEVICE_CHANNEL_ENABLED", str(merged.get("device_channel_enabled", False))
-            ),
-            False,
-        ),
         database=parse_database_config(merged_db),
         database_in_file=database_in_file,
         tls=_parse_tls_section(raw.get("tls")),

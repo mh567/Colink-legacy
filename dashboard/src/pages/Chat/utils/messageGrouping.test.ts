@@ -260,49 +260,6 @@ describe("groupConsecutiveAssistantMessages", () => {
     expect(speakerTurnWasInterrupted(messages, 0, undefined)).toBe(true);
   });
 
-  it("starts a new member answer when a remote dispatch has only emitted a tool", () => {
-    const messages = [
-      msg("assistant", "old-answer", {
-        content: "Previous answer",
-        speakerAgentId: "doctor",
-      }),
-      msg("assistant", "old-summary", {
-        content: "Previous summary",
-        speakerAgentId: "host",
-        teamWrapup: true,
-      }),
-      msg("assistant", "new-dispatch", {
-        speakerAgentId: "host",
-        toolData: { name: "ask_agent", arguments: "{}", output: "queued" },
-      }),
-    ];
-    expect(
-      findSpeakerTextToContinue(messages, "doctor", "host", { teamRoom: true }),
-    ).toBe(-1);
-  });
-
-  it("continues an active member while another member's wrap-up is interleaved", () => {
-    const messages = [
-      msg("assistant", "dispatch", {
-        content: "Ask both members",
-        speakerAgentId: "host",
-      }),
-      msg("assistant", "answer", {
-        content: "Still working",
-        speakerAgentId: "doctor",
-        status: "streaming",
-      }),
-      msg("assistant", "summary", {
-        content: "The other member finished",
-        speakerAgentId: "host",
-        teamWrapup: true,
-      }),
-    ];
-    expect(
-      findSpeakerTextToContinue(messages, "doctor", "host", { teamRoom: true }),
-    ).toBe(1);
-  });
-
   it("does not resume a prior turn after a user message", () => {
     const messages = [
       msg("assistant", "old", { content: "before" }),
