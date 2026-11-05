@@ -48,8 +48,9 @@ def test_build_fpk_lite_pins_the_lite_image_tag() -> None:
 
 
 def test_publish_workflows_keep_full_when_lite_is_incomplete() -> None:
-    docker = (REPO / ".github/workflows/docker-publish.yml").read_text(encoding="utf-8")
-    fnos = (REPO / ".github/workflows/fnos-build-fpk.yml").read_text(encoding="utf-8")
+    workflows = REPO / ".github/upstream-workflows"
+    docker = (workflows / "docker-publish.yml.disabled").read_text(encoding="utf-8")
+    fnos = (workflows / "fnos-build-fpk.yml.disabled").read_text(encoding="utf-8")
     assert "until both amd64 and arm64 exist" in docker
     assert 'echo "lite=false"' in fnos
     assert "Skipping the lite FnOS package" in fnos

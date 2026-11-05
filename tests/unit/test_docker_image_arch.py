@@ -57,7 +57,8 @@ def test_clean_import_is_not_sigill() -> None:
 def test_docker_publish_still_builds_arm64() -> None:
     """ARM NAS uses the same tag; dropping arm64 from CI is how that image disappears."""
     root = Path(__file__).resolve().parents[2]
-    text = (root / ".github/workflows/docker-publish.yml").read_text(encoding="utf-8")
+    workflow = root / ".github/upstream-workflows/docker-publish.yml.disabled"
+    text = workflow.read_text(encoding="utf-8")
     assert "linux/arm64" in text
     assert "ubuntu-24.04-arm" in text
     assert "A package on the missing CPU will not run." in text
